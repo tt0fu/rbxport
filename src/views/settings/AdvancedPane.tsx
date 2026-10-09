@@ -2,13 +2,16 @@
  * Advanced: Database, Browse and Others. Captures docs/screenshots 9.49.32
  * to 9.49.51 PM.
  *
- * Database holds the library's own facts and the missing-file manager,
- * with rekordbox's Auto Relocate Search Folders feeding it. Browse holds
+ * Database holds the library's own facts, rekordbox's Database management
+ * (the one place rekordbox chooses which library it works on), and
+ * rekordbox's Auto Relocate Search Folders, which the Missing File Manager
+ * (File › Display All Missing Files) and a missing track's Auto Relocate
+ * search. Browse holds
  * Library Protection and Edit Library. Others holds BEAT/BPM SYNC, the
  * quantize beat value and play history.
  *
  * Not here: iTunes and rekordbox xml (neither is read), Auto Export and
- * Database management (neither is built), My Tag, colour names, display
+ * Database management's Move Database (neither is built), My Tag, colour names, display
  * speed, the long-press menu and the Tag List (none exist here), the
  * export name (link export is not built), hot cue GATE, loop export,
  * Recordings, and every streaming service.
@@ -16,12 +19,12 @@
 import { useEffect, useRef, useState } from "react";
 
 import { getBackend } from "@/ipc/client";
-import type { Duplicates, LibrarySummary, MissingTracks, RelocateReport } from "@/ipc/types";
+import type { DatabaseDrive, Duplicates, LibrarySummary } from "@/ipc/types";
 import { useTranslation } from "@/i18n";
-import { QUANTIZE_BEATS } from "@/lib/preferences";
+import { QUANTIZE_BEATS, type AdvancedPreferences } from "@/lib/preferences";
 import { usePreferencesContext } from "@/store/usePreferences";
 import styles from "./Preferences.module.css";
-import { Button, Note, Radios, Section, Select, Sub, Toggle } from "./controls";
+import { Button, Checkbox, Note, Radios, Section, Select, Sub, Toggle } from "./controls";
 
 export type AdvancedTab = "database" | "browse" | "others";
 
@@ -30,9 +33,6 @@ export const ADVANCED_TABS: readonly { id: AdvancedTab; label: string }[] = [
   { id: "browse", label: "Browse" },
   { id: "others", label: "Others" },
 ];
-
-/** How many missing tracks to list. The count above it is exact. */
-const MISSING_SHOWN = 20;
 
 export function AdvancedPane({ tab, summary }: {
   tab: AdvancedTab;
@@ -178,13 +178,79 @@ export function AdvancedPane({ tab, summary }: {
           </dd>
         </dl>
       </Section>
-      <RelocateSection
-        folders={advanced.relocateFolders}
-        onFolders={(relocateFolders) => set({ relocateFolders })}
-        readOnly={(summary?.readOnly ?? false) || advanced.protectLibrary}
-      />
+      <RelocateSection advanced={advanced} set={set} />
       <DuplicatesSection readOnly={(summary?.readOnly ?? false) || advanced.protectLibrary} />
+      {/* Last, as in rekordbox, under the external-drive settings. */}
+      <DatabaseManagementSection readOnly={summary?.readOnly ?? false} />
     </>
+  );
+}
+
+/**
+ * rekordbox's Database management: which drive's Master Database the
+ * library is. The list is the default drive when it holds a library, then
+ * every connected drive holding `PIONEER/Master/master.db` (or
+ * `.PIONEER/Master` on HFS), named by volume label (`C:BOOTCAMP` on
+ * Windows), and it is greyed out while there is only one; choosing one asks
+ * "Are you sure you want to switch Master Database?" and switches
+ * (`DetailDatabaseManagement::setup`, `comboBoxChanged`, `selectDrive`)
+ * [OBS rekordbox 7.2.11, static analysis; Windows layout observed on
+ * chris-win11 2026-10-08]. Its "?" help and Move Database are not built.
+ * Here the switch sets rekordbox's
+ * own `masterDbDirectory` and the app starts again on the chosen library.
+ * Not while rekordbox runs: it puts its own setting back when it quits.
+ */
+function DatabaseManagementSection({ readOnly }: { readOnly: boolean }) {
+  const t = useTranslation();
+  const [drives, setDrives] = useState<DatabaseDrive[]>([]);
+  const [switching, setSwitching] = useState(false);
+  const [failed, setFailed] = useState<string | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    void getBackend()
+      .then((backend) => backend.databaseDrives())
+      .then((found) => { if (live) setDrives(found); })
+      .catch(() => { if (live) setDrives([]); });
+    return () => { live = false; };
+  }, []);
+
+  const current = drives.find((drive) => drive.current)?.masterDb ?? drives[0]?.masterDb ?? "";
+  const choose = async (masterDb: string) => {
+    if (masterDb === current) return;
+    const backend = await getBackend();
+    const sure = await backend.confirm(
+      [t("Are you sure you want to switch Master Database?"), t("This operation may require long time.")].join("\n"),
+      { yes: t("OK"), no: t("Cancel") },
+    );
+    if (!sure) return;
+    setSwitching(true);
+    setFailed(null);
+    try {
+      await backend.switchLibrary(masterDb);
+      setDrives((all) => all.map((drive) => ({ ...drive, current: drive.masterDb === masterDb })));
+    } catch {
+      // rekordbox says only this; the reason is in the log.
+      setFailed(t("Failed to switch Master Database."));
+    } finally {
+      setSwitching(false);
+    }
+  };
+
+  return (
+    <Section title="Database management">
+      <Sub>Select a drive</Sub>
+      <Select
+        label="Select a drive"
+        nested
+        value={current}
+        choices={drives.map((drive) => ({ value: drive.masterDb, label: drive.name }))}
+        preserveChoiceLabels
+        disabled={readOnly || switching || drives.length < 2}
+        onChange={(masterDb) => { void choose(masterDb); }}
+      />
+      {failed ? <Note failed>{failed}</Note> : null}
+    </Section>
   );
 }
 
@@ -285,141 +351,78 @@ function DuplicatesSection({ readOnly }: { readOnly: boolean }) {
   );
 }
 
-function RelocateSection({ folders, onFolders, readOnly }: {
-  folders: readonly string[];
-  onFolders: (folders: string[]) => void;
-  readOnly: boolean;
+/**
+ * rekordbox's Auto Relocate Search Folders [OBS rekordbox 7.2.19 static,
+ * `DetailAutoRelocate::DetailAutoRelocate` @0x1006b4894]: the Music,
+ * Movies and Desktop boxes stacked under the heading, then Specified user
+ * folders, then the folder list with Add and Del, which are greyed until that
+ * box is ticked. Music, Movies and Desktop start ticked; Specified user
+ * folders does not (`SettingIF::isSelectedAutoRelocate*Folder`). Auto
+ * Relocate searches the ticked ones in that order, the user's folders first.
+ *
+ * The second box is "Movies": the constructor names it "Video", and
+ * `lookAndFeelChanged` @0x1006b5584 renames it "Movies" with no platform
+ * check, and rekordbox's shared .lang files carry "Music", "Movies" and
+ * "Desktop" together. [ASSUME] Windows shows "Movies" too (not yet seen on a
+ * Windows rekordbox).
+ */
+function RelocateSection({ advanced, set }: {
+  advanced: AdvancedPreferences;
+  set: (patch: Partial<AdvancedPreferences>) => void;
 }) {
-  const [missing, setMissing] = useState<MissingTracks | null>(null);
-  const [scanning, setScanning] = useState(false);
+  const t = useTranslation();
+  const folders = advanced.relocateFolders;
+  const own = advanced.relocateUserFolders;
   const [picked, setPicked] = useState<string>(folders[0] ?? "");
-  const [report, setReport] = useState<RelocateReport | null>(null);
   const current = folders.includes(picked) ? picked : (folders[0] ?? "");
 
-  const rescan = async () => {
-    const backend = await getBackend();
-    setMissing(await backend.missingTracks(MISSING_SHOWN));
-  };
-
   return (
-    <>
-      <Section title="Auto Relocate Search Folders">
-        <Sub>Specified user folders</Sub>
-        <div className={styles.actions}>
-          <select
-            className={styles.select}
-            data-plain
-            aria-label="Search folders"
-            value={current}
-            onChange={(e) => setPicked(e.target.value)}
-          >
-            {folders.length === 0 ? <option value="">No folders</option> : null}
-            {folders.map((folder) => (
-              <option key={folder} value={folder}>{folder}</option>
-            ))}
-          </select>
-          <Button
-            onClick={() => {
-              void (async () => {
-                const backend = await getBackend();
-                const folder = await backend.pickFolder("Choose a folder to search for moved files");
-                if (folder === null || folders.includes(folder)) return;
-                onFolders([...folders, folder]);
-                setPicked(folder);
-              })();
-            }}
-          >
-            Add
-          </Button>
-          <Button disabled={current === ""} onClick={() => onFolders(folders.filter((f) => f !== current))}>
-            Del
-          </Button>
-        </div>
-      </Section>
-
-      <Section title="Missing files">
-        {missing === null ? (
-          <>
-            <div className={styles.actions}>
-              <Button
-                disabled={scanning}
-                onClick={() => {
-                  setScanning(true);
-                  void rescan().finally(() => setScanning(false));
-                }}
-              >
-                {scanning ? "Checking…" : "Check for missing files"}
-              </Button>
-            </div>
-          </>
-        ) : missing.total === 0 ? (
-          <Note>Every track&rsquo;s file is where the library expects it.</Note>
-        ) : (
-          <>
-            <Note>
-              {missing.total.toLocaleString()} track{missing.total === 1 ? "" : "s"} cannot be found.
-            </Note>
-            <div className={styles.actions}>
-              <Button
-                disabled={readOnly || folders.length === 0 || scanning}
-                onClick={() => {
-                  setScanning(true);
-                  void (async () => {
-                    try {
-                      const backend = await getBackend();
-                      setReport(await backend.autoRelocate([...folders]));
-                      await rescan();
-                    } finally {
-                      setScanning(false);
-                    }
-                  })();
-                }}
-              >
-                {scanning ? "Searching…" : "Auto Relocate"}
-              </Button>
-            </div>
-            {report ? (
-              <Note>
-                {report.relocated} relocated
-                {report.unresolved > 0 ? `, ${report.unresolved} not found in the search folders.` : "."}
-              </Note>
-            ) : folders.length === 0 ? (
-              <Note>Add a search folder above to relocate them automatically.</Note>
-            ) : null}
-            <ul className={styles.list}>
-              {missing.tracks.map((track) => (
-                <li key={track.id}>
-                  <span className={styles.listTitle}>
-                    {track.title}
-                    {track.artist ? ` — ${track.artist}` : ""}
-                  </span>
-                  <span className={styles.listPath}>{track.path}</span>
-                  <button
-                    type="button"
-                    className={styles.listAction}
-                    disabled={readOnly}
-                    onClick={() => {
-                      void (async () => {
-                        const backend = await getBackend();
-                        const chosen = await backend.relocateTrack(track.id);
-                        // Cancelling leaves the list alone; a successful
-                        // relocate means the track is no longer missing.
-                        if (chosen === null) return;
-                        await rescan();
-                      })();
-                    }}
-                  >
-                    Locate&hellip;
-                  </button>
-                </li>
-              ))}
-            </ul>
-            {missing.total > missing.tracks.length ? (
-              <Note>Showing the first {missing.tracks.length}.</Note>
-            ) : null}
-          </>
-        )}
-      </Section>
-    </>
+    <Section title="Auto Relocate Search Folders">
+      <Checkbox label="Music" checked={advanced.relocateMusic} onChange={(relocateMusic) => set({ relocateMusic })} />
+      <Checkbox label="Movies" checked={advanced.relocateVideo} onChange={(relocateVideo) => set({ relocateVideo })} />
+      <Checkbox label="Desktop" checked={advanced.relocateDesktop} onChange={(relocateDesktop) => set({ relocateDesktop })} />
+      <Checkbox
+        label="Specified user folders"
+        checked={own}
+        onChange={(relocateUserFolders) => set({ relocateUserFolders })}
+      />
+      <div className={styles.actions}>
+        <select
+          className={styles.select}
+          data-plain
+          aria-label="Search folders"
+          value={current}
+          disabled={!own}
+          onChange={(e) => setPicked(e.target.value)}
+        >
+          {folders.length === 0 ? <option value="">(no choices)</option> : null}
+          {folders.map((folder) => (
+            <option key={folder} value={folder}>{folder}</option>
+          ))}
+        </select>
+        <Button
+          disabled={!own}
+          onClick={() => {
+            void (async () => {
+              const backend = await getBackend();
+              // [OBS static] rekordbox's Add (`DetailAutoRelocate::buttonClicked`
+              // @0x1006b5a4c) browses for a folder under this title.
+              const folder = await backend.pickFolder(t("Choose a new fullpath for"));
+              if (folder === null || folders.includes(folder)) return;
+              set({ relocateFolders: [...folders, folder] });
+              setPicked(folder);
+            })();
+          }}
+        >
+          Add
+        </Button>
+        <Button
+          disabled={!own || current === ""}
+          onClick={() => set({ relocateFolders: folders.filter((f) => f !== current) })}
+        >
+          Del
+        </Button>
+      </div>
+    </Section>
   );
 }

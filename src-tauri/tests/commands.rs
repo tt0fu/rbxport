@@ -23,6 +23,7 @@ use rbxport_lib::cues::{self, CueKind};
 use rbxport_lib::details;
 use rbxport_lib::dto::{RowDto, TrackFilterDto, TrackSourceDto, TreeNodeDto, ViewSpecDto};
 use rbxport_lib::player::{Player, TickDto};
+use rbxport_lib::preview::{Preview, PreviewStateDto};
 use rbxport_lib::state::AppState;
 use rbxport_lib::ErrorKind;
 use tauri::test::MockRuntime;
@@ -37,10 +38,14 @@ struct Shell {
     app: tauri::App<MockRuntime>,
     /// The engine's output, once a deck command has opened it.
     sink: Arc<Mutex<Option<Arc<NullSink>>>>,
+    /// The preview player's output, once something has been previewed.
+    preview_sink: Arc<Mutex<Option<Arc<NullSink>>>>,
     /// Every `library:changed` generation the interface would have seen.
     changes: Arc<Mutex<Vec<u32>>>,
     /// How many `tag-list:changed` the interface would have seen.
     tag_list_changes: Arc<Mutex<usize>>,
+    /// The fixture library, to read rows back the way rekordbox would.
+    location: rbl_db::LibraryLocation,
 }
 
 /// A mock app over a fresh fixture, loaded the way `spawn_library_load`
@@ -56,7 +61,7 @@ fn shell_with_shape(shape: Shape) -> Shell {
     let state = AppState::with_backups(dir.path().join("backups"));
     let db = Db::open(location.clone(), OpenMode::ReadOnly).expect("open the fixture");
     let (library, _) = rbl_index::load(&db).expect("index the fixture");
-    state.set_library(library, false, db.schema().db_version, 0, location);
+    state.set_library(library, false, db.schema().db_version, 0, location.clone());
 
     let sink: Arc<Mutex<Option<Arc<NullSink>>>> = Arc::new(Mutex::new(None));
     let slot = Arc::clone(&sink);
@@ -66,9 +71,18 @@ fn shell_with_shape(shape: Shape) -> Shell {
         Ok(opened as Arc<dyn Sink>)
     }));
 
+    let preview_sink: Arc<Mutex<Option<Arc<NullSink>>>> = Arc::new(Mutex::new(None));
+    let preview_slot = Arc::clone(&preview_sink);
+    let preview = Preview::with_sink(Box::new(move |render, _device, _wish| {
+        let opened = Arc::new(NullSink::new(RATE, render));
+        *preview_slot.lock().unwrap() = Some(Arc::clone(&opened));
+        Ok(opened as Arc<dyn Sink>)
+    }));
+
     let app = tauri::test::mock_app();
     app.manage(Arc::new(state));
     app.manage(Arc::new(player));
+    app.manage(Arc::new(preview));
 
     let changes: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
     let seen = Arc::clone(&changes);
@@ -82,7 +96,7 @@ fn shell_with_shape(shape: Shape) -> Shell {
     let tagged = Arc::clone(&tag_list_changes);
     app.listen("tag-list:changed", move |_| *tagged.lock().unwrap() += 1);
 
-    Shell { _dir: dir, app, sink, changes, tag_list_changes }
+    Shell { _dir: dir, app, sink, preview_sink, changes, tag_list_changes, location }
 }
 
 /// Runs a command the way the invoke handler does: to completion, on the
@@ -139,6 +153,30 @@ impl Shell {
 
     fn deck_state(&self) -> TickDto {
         run(commands::deck_state(self.player())).unwrap()
+    }
+
+    fn preview(&self) -> State<'_, Arc<Preview>> {
+        self.app.state::<Arc<Preview>>()
+    }
+
+    fn preview_state(&self) -> PreviewStateDto {
+        run(commands::preview_state(self.preview())).unwrap()
+    }
+
+    /// Pulls the preview's output until the condition holds, or gives up.
+    fn pull_preview_until(&self, what: &str, mut done: impl FnMut(&PreviewStateDto) -> bool) -> PreviewStateDto {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = self.preview_state();
+            if done(&state) {
+                return state;
+            }
+            assert!(Instant::now() < deadline, "gave up waiting for {what}: {state:?}");
+            if let Some(sink) = self.preview_sink.lock().unwrap().clone() {
+                sink.pull(512);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// Pulls the sink until the condition holds, or gives up. The engine
@@ -538,7 +576,7 @@ fn library_history_names_and_reverses_each_supported_edit() {
     assert_eq!(ids(&s.playlist_rows(&playlist.id)), [tracks[0].as_str(), tracks[2].as_str()]);
 
     let track = track_id(7);
-    let edited = run(commands::set_track_rating(s.handle(), s.state(), track.clone(), 4)).unwrap();
+    let edited = run(commands::set_track_rating(s.handle(), s.state(), vec![track.clone()], 4)).unwrap();
     assert_eq!(edited.undo_label.as_deref(), Some("Track Edit"));
     run(commands::undo_edit(s.handle(), s.state())).unwrap();
     assert_eq!(run(details::track_details(s.state(), track.clone())).unwrap().rating, 0);
@@ -546,7 +584,7 @@ fn library_history_names_and_reverses_each_supported_edit() {
     assert_eq!(run(details::track_details(s.state(), track.clone())).unwrap().rating, 4);
 
     let field = run(details::set_track_field(
-        s.handle(), s.state(), track.clone(), "title".into(), "Seven".into(),
+        s.handle(), s.state(), vec![track.clone()], "title".into(), "Seven".into(),
     )).unwrap();
     assert_eq!(field.undo_label.as_deref(), Some("Track Edit"));
     run(commands::undo_edit(s.handle(), s.state())).unwrap();
@@ -559,10 +597,45 @@ fn library_history_names_and_reverses_each_supported_edit() {
 fn removing_from_collection_is_permanent_and_clears_history() {
     let s = shell();
     let track = track_id(5);
-    run(commands::set_track_rating(s.handle(), s.state(), track.clone(), 3)).unwrap();
+    run(commands::set_track_rating(s.handle(), s.state(), vec![track.clone()], 3)).unwrap();
     run(commands::remove_from_collection(s.handle(), s.state(), vec![track])).unwrap();
     let error = run(commands::undo_edit(s.handle(), s.state())).unwrap_err();
     assert_eq!(error.kind, ErrorKind::NotFound);
+}
+
+/// A multi-selection removed from the collection (#136) takes every selected
+/// track out of the collection and out of each playlist it was in, and leaves
+/// the rest alone. rekordbox's Delete key and Remove from Collection both pass
+/// the whole selection to `DatabaseIF::removeFromCollection` [OBS static,
+/// rekordbox 7.2.19 `browse::ListViewer::deleteKeyPressed` @0x1004069b8].
+#[test]
+fn removing_several_tracks_from_the_collection_removes_every_one() {
+    let s = shell();
+    run(commands::create_playlist(s.handle(), s.state(), "Set".into(), ROOT.into())).unwrap();
+    let playlist = s.node("Set").id;
+    let members = vec![track_id(1), track_id(2), track_id(3), track_id(4)];
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), playlist.clone(), members.clone())).unwrap();
+
+    let (view, before) = s.open(collection_spec());
+    let all = s.rows(view);
+    assert_eq!(all.len(), before as usize);
+
+    let selected = vec![track_id(2), track_id(3), track_id(9)];
+    run(commands::remove_from_collection(s.handle(), s.state(), selected.clone())).unwrap();
+
+    let (view, after) = s.open(collection_spec());
+    let left = s.rows(view);
+    assert_eq!(after as usize, before as usize - selected.len(), "every selected track leaves");
+    for id in &selected {
+        assert!(!ids(&left).contains(&id.as_str()), "{id} is still in the collection");
+    }
+    let kept: Vec<&str> = ids(&all).into_iter().filter(|id| !selected.iter().any(|s| s == id)).collect();
+    assert_eq!(ids(&left), kept, "the other tracks stay, in order");
+    assert_eq!(
+        ids(&s.playlist_rows(&playlist)),
+        [members[0].as_str(), members[3].as_str()],
+        "the removed tracks leave the playlist too",
+    );
 }
 
 #[test]
@@ -571,7 +644,7 @@ fn every_edit_bumps_the_generation_and_tells_the_interface() {
     let (_, _, _, start) = s.state().summary();
 
     let first = run(commands::create_playlist(s.handle(), s.state(), "One".into(), ROOT.into())).unwrap();
-    let second = run(commands::set_track_rating(s.handle(), s.state(), track_id(0), 3)).unwrap();
+    let second = run(commands::set_track_rating(s.handle(), s.state(), vec![track_id(0)], 3)).unwrap();
     assert!(first > start);
     assert!(second.generation > first);
     assert_eq!(s.state().summary().3, second.generation, "the state reports the latest");
@@ -591,19 +664,19 @@ fn library_backups_are_manual_only() {
     let backups = s._dir.path().join("backups");
     assert!(!backups.exists());
 
-    run(commands::set_track_rating(s.handle(), s.state(), track_id(0), 3)).unwrap();
+    run(commands::set_track_rating(s.handle(), s.state(), vec![track_id(0)], 3)).unwrap();
     assert!(!backups.exists(), "the first edit must not back up");
 
     // Every kind of edit opens its own writer; none should copy the database.
-    run(commands::set_track_comment(s.handle(), s.state(), track_id(0), "x".into())).unwrap();
+    run(commands::set_track_comment(s.handle(), s.state(), vec![track_id(0)], "x".into())).unwrap();
     run(commands::create_playlist(s.handle(), s.state(), "Later".into(), ROOT.into())).unwrap();
     run(cues::add_cue(s.handle(), s.state(), track_id(0), CueKind::Memory, 1_000)).unwrap();
-    run(details::set_track_field(s.handle(), s.state(), track_id(0), "title".into(), "T".into())).unwrap();
+    run(details::set_track_field(s.handle(), s.state(), vec![track_id(0)], "title".into(), "T".into())).unwrap();
     assert!(!backups.exists(), "edits must not back up automatically");
 
     let path = run(commands::back_up_library(s.state())).unwrap();
     assert!(Path::new(&path).is_file(), "manual backups remain available");
-    run(commands::set_track_rating(s.handle(), s.state(), track_id(0), 4)).unwrap();
+    run(commands::set_track_rating(s.handle(), s.state(), vec![track_id(0)], 4)).unwrap();
     assert_eq!(std::fs::read_dir(&backups).unwrap().count(), 1);
 }
 
@@ -633,8 +706,89 @@ fn a_write_the_library_refuses_is_read_only_to_the_interface_and_changes_nothing
     assert_eq!(s.state().summary().3, generation, "nothing was reloaded");
     assert!(s.changes.lock().unwrap().is_empty());
 
-    let err = run(commands::set_track_rating(s.handle(), s.state(), track_id(0), 9)).unwrap_err();
+    let err = run(commands::set_track_rating(s.handle(), s.state(), vec![track_id(0)], 9)).unwrap_err();
     assert_eq!(err.kind, ErrorKind::ReadOnly);
+}
+
+/// Every playlist and membership row, and the USN counter: what an import
+/// that writes nothing must leave exactly as it was.
+fn playlist_snapshot(s: &Shell) -> (Vec<String>, Vec<String>, i64) {
+    let db = Db::open(s.location.clone(), OpenMode::ReadOnly).unwrap();
+    let conn = db.connection();
+    let rows = |sql: &str| -> Vec<String> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0)).unwrap().map(Result::unwrap).collect()
+    };
+    let lists = rows(
+        "SELECT ID || '|' || ParentID || '|' || Name || '|' || Seq || '|' || rb_local_deleted || '|' || rb_local_usn
+         FROM djmdPlaylist ORDER BY ID",
+    );
+    let members = rows(
+        "SELECT ID || '|' || PlaylistID || '|' || ContentID || '|' || TrackNo || '|' || rb_local_deleted || '|' || rb_local_usn
+         FROM djmdSongPlaylist ORDER BY ID",
+    );
+    let usn = conn
+        .query_row("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'", [], |r| r.get(0))
+        .unwrap();
+    (lists, members, usn)
+}
+
+/// Issue #152: rekordbox asks "One or several lists with the same name
+/// already exist." before an import that would replace lists, and Cancel
+/// imports nothing. The command keeps that promise itself: without
+/// `replace` it names the lists and writes, reloads and announces nothing;
+/// with `replace` it replaces them.
+#[test]
+fn an_xml_import_that_would_replace_lists_writes_nothing_until_told_to() {
+    let s = shell();
+    let audio: Vec<PathBuf> =
+        ["One", "Two"].iter().map(|n| write_wav(&s._dir.path().join(format!("{n}.wav")), 1)).collect();
+    let location = |p: &Path| format!("file://localhost{}", p.to_string_lossy().replace(' ', "%20"));
+    let doc = |keys: &[u8]| {
+        let members: String = keys.iter().map(|k| format!(r#"<TRACK Key="{k}"/>"#)).collect();
+        format!(
+            r#"<?xml version="1.0"?><DJ_PLAYLISTS Version="1.0.0"><COLLECTION Entries="2">
+            <TRACK TrackID="1" Name="One" Location="{}"/>
+            <TRACK TrackID="2" Name="Two" Location="{}"/>
+            </COLLECTION><PLAYLISTS><NODE Type="0" Name="ROOT" Count="1">
+            <NODE Name="Issue 152" Type="1" KeyType="0" Entries="{}">{members}</NODE>
+            </NODE></PLAYLISTS></DJ_PLAYLISTS>"#,
+            location(&audio[0]),
+            location(&audio[1]),
+            keys.len(),
+        )
+    };
+    let file = s._dir.path().join("collection.xml");
+    std::fs::write(&file, doc(&[1, 2])).unwrap();
+    let path = file.display().to_string();
+
+    let first = run(commands::import_xml(s.handle(), s.state(), path.clone(), None)).unwrap();
+    assert!(first.same_named.is_empty());
+    assert_eq!((first.imported, first.playlists), (2, 1));
+    let list = s.node("Issue 152").id;
+    let titles = |s: &Shell| -> Vec<String> { s.playlist_rows(&list).iter().map(|r| r.title.clone()).collect() };
+    assert_eq!(titles(&s), vec!["One", "Two"]);
+
+    // The next export dropped "One".
+    std::fs::write(&file, doc(&[2])).unwrap();
+    let before = playlist_snapshot(&s);
+    let generation = s.state().summary().3;
+    let changes = s.changes.lock().unwrap().len();
+
+    let asked = run(commands::import_xml(s.handle(), s.state(), path.clone(), None)).unwrap();
+    assert_eq!(asked.same_named, vec!["Issue 152"]);
+    assert_eq!((asked.imported, asked.playlists), (0, 0));
+    assert_eq!(playlist_snapshot(&s), before, "no row and no USN changed");
+    assert_eq!(s.state().summary().3, generation, "nothing was reloaded");
+    assert_eq!(s.changes.lock().unwrap().len(), changes, "nothing was announced");
+    assert_eq!(titles(&s), vec!["One", "Two"]);
+
+    let replaced = run(commands::import_xml(s.handle(), s.state(), path, Some(true))).unwrap();
+    assert!(replaced.same_named.is_empty());
+    assert!(s.state().summary().3 > generation, "the replacement reloads the library");
+    assert_eq!(s.node("Issue 152").id, list, "replaced where it stands, not doubled");
+    assert_eq!(titles(&s), vec!["Two"]);
+    assert_ne!(playlist_snapshot(&s).2, before.2);
 }
 
 // ----------------------------------------------------------- the Tag List
@@ -721,10 +875,10 @@ fn a_rating_a_comment_and_a_colour_show_in_the_rows_after_the_edit() {
     let s = shell();
     let track = track_id(7);
 
-    run(commands::set_track_rating(s.handle(), s.state(), track.clone(), 4)).unwrap();
-    run(commands::set_track_comment(s.handle(), s.state(), track.clone(), "opener — long intro".into()))
+    run(commands::set_track_rating(s.handle(), s.state(), vec![track.clone()], 4)).unwrap();
+    run(commands::set_track_comment(s.handle(), s.state(), vec![track.clone()], "opener — long intro".into()))
         .unwrap();
-    run(commands::set_track_color(s.handle(), s.state(), track.clone(), Some("pink".into()))).unwrap();
+    run(commands::set_track_color(s.handle(), s.state(), vec![track.clone()], Some("pink".into()))).unwrap();
 
     let (view, _) = s.open(collection_spec());
     let rows = s.rows(view);
@@ -736,8 +890,8 @@ fn a_rating_a_comment_and_a_colour_show_in_the_rows_after_the_edit() {
     let (view, _) = s.open(ViewSpecDto { sort: "rating".into(), descending: true, ..collection_spec() });
     assert_eq!(s.rows(view)[0].id, track);
 
-    run(commands::set_track_rating(s.handle(), s.state(), track.clone(), 0)).unwrap();
-    run(commands::set_track_color(s.handle(), s.state(), track.clone(), None)).unwrap();
+    run(commands::set_track_rating(s.handle(), s.state(), vec![track.clone()], 0)).unwrap();
+    run(commands::set_track_color(s.handle(), s.state(), vec![track.clone()], None)).unwrap();
     let (view, _) = s.open(collection_spec());
     assert_eq!(s.rows(view).iter().find(|r| r.id == track).unwrap().rating, 0);
 }
@@ -753,11 +907,11 @@ fn the_information_panel_reads_the_record_and_writes_a_field_the_rows_follow() {
     assert_eq!(record.rating, 0);
     assert_eq!(record.duration_sec, 300);
 
-    run(details::set_track_field(s.handle(), s.state(), track.clone(), "title".into(), "Nine".into())).unwrap();
-    run(details::set_track_field(s.handle(), s.state(), track.clone(), "artist".into(), "Somebody".into()))
+    run(details::set_track_field(s.handle(), s.state(), vec![track.clone()], "title".into(), "Nine".into())).unwrap();
+    run(details::set_track_field(s.handle(), s.state(), vec![track.clone()], "artist".into(), "Somebody".into()))
         .unwrap();
-    run(details::set_track_field(s.handle(), s.state(), track.clone(), "year".into(), "2019".into())).unwrap();
-    run(commands::set_track_rating(s.handle(), s.state(), track.clone(), 2)).unwrap();
+    run(details::set_track_field(s.handle(), s.state(), vec![track.clone()], "year".into(), "2019".into())).unwrap();
+    run(commands::set_track_rating(s.handle(), s.state(), vec![track.clone()], 2)).unwrap();
 
     let record = run(details::track_details(s.state(), track.clone())).unwrap();
     assert_eq!((record.title.as_str(), record.artist.as_str(), record.year, record.rating), ("Nine", "Somebody", 2019, 2));
@@ -771,11 +925,78 @@ fn the_information_panel_reads_the_record_and_writes_a_field_the_rows_follow() {
     assert_eq!(s.rows(view)[0].id, track, "the one track with an artist sorts first");
 
     // A field the writer does not take is refused before anything is opened.
-    let err = run(details::set_track_field(s.handle(), s.state(), track.clone(), "bitrate".into(), "320".into()))
+    let err = run(details::set_track_field(s.handle(), s.state(), vec![track.clone()], "bitrate".into(), "320".into()))
         .unwrap_err();
     assert_eq!(err.kind, ErrorKind::ReadOnly);
-    let err = run(details::set_track_field(s.handle(), s.state(), track, "year".into(), "soon".into())).unwrap_err();
+    let err = run(details::set_track_field(s.handle(), s.state(), vec![track], "year".into(), "soon".into())).unwrap_err();
     assert_eq!(err.kind, ErrorKind::ReadOnly);
+}
+
+/// Issue #112: several tracks selected in the browser are one record in the
+/// information panel — the first track's, with the fields they do not share
+/// named — and an edit goes to every one of them as one step of history.
+#[test]
+fn the_information_panel_reads_and_writes_a_multiple_selection() {
+    let s = shell();
+    let tracks = vec![track_id(2), track_id(3), track_id(4)];
+
+    let selection = run(details::selection_details(s.state(), tracks.clone())).unwrap();
+    assert_eq!(selection.count, 3);
+    assert_eq!(selection.first.id, tracks[0]);
+    assert!(selection.mixed.iter().any(|f| f == "title"), "{:?}", selection.mixed);
+    assert!(!selection.mixed.iter().any(|f| f == "genre"), "{:?}", selection.mixed);
+    assert!(!selection.mixed.iter().any(|f| f == "artwork"), "none has artwork");
+
+    let edit = run(details::set_track_field(s.handle(), s.state(), tracks.clone(), "genre".into(), "Techno".into()))
+        .unwrap();
+    assert_eq!(edit.undo_label.as_deref(), Some("Track Edit"));
+    run(commands::set_track_rating(s.handle(), s.state(), tracks.clone(), 5)).unwrap();
+    for track in &tracks {
+        let record = run(details::track_details(s.state(), track.clone())).unwrap();
+        assert_eq!((record.genre.as_str(), record.rating), ("Techno", 5), "{track}");
+    }
+    let untouched = run(details::track_details(s.state(), track_id(5))).unwrap();
+    assert_eq!((untouched.genre.as_str(), untouched.rating), ("", 0));
+    let selection = run(details::selection_details(s.state(), tracks.clone())).unwrap();
+    assert_eq!(selection.first.genre, "Techno");
+    assert!(!selection.mixed.iter().any(|f| f == "genre" || f == "rating"));
+
+    // One undo takes the rating back from all three, and leaves the genre.
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    for track in &tracks {
+        let record = run(details::track_details(s.state(), track.clone())).unwrap();
+        assert_eq!((record.genre.as_str(), record.rating), ("Techno", 0), "{track}");
+    }
+
+    // rekordbox greys the Track Title box for several tracks; the command
+    // refuses a title for more than one.
+    let err = run(details::set_track_field(s.handle(), s.state(), tracks, "title".into(), "Same".into()))
+        .unwrap_err();
+    assert_eq!(err.kind, ErrorKind::ReadOnly);
+}
+
+/// The list keeps a selection's ids after the tracks behind them leave the
+/// collection. An edit over that selection writes the tracks still there,
+/// as one step that one Undo takes back, rather than failing on the gone
+/// one after writing the tracks before it.
+#[test]
+fn an_edit_over_a_selection_with_a_removed_track_writes_the_rest_as_one_step() {
+    let s = shell();
+    let tracks = vec![track_id(2), track_id(3), track_id(4)];
+    run(commands::remove_from_collection(s.handle(), s.state(), vec![track_id(3)])).unwrap();
+
+    run(details::set_track_field(s.handle(), s.state(), tracks.clone(), "genre".into(), "Techno".into()))
+        .unwrap();
+    for track in [track_id(2), track_id(4)] {
+        let record = run(details::track_details(s.state(), track.clone())).unwrap();
+        assert_eq!(record.genre, "Techno", "{track}");
+    }
+
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    for track in [track_id(2), track_id(4)] {
+        let record = run(details::track_details(s.state(), track.clone())).unwrap();
+        assert_eq!(record.genre, "", "{track} undone");
+    }
 }
 
 #[test]
@@ -831,6 +1052,39 @@ fn a_cue_added_through_the_command_is_read_back_and_announced() {
     let announced = announced.lock().unwrap();
     assert_eq!(announced.len(), 5);
     assert!(announced.iter().all(|t| *t == track));
+}
+
+/// A drive library's Location, in the Info panel and the browser column, is
+/// the path rekordbox shows: the stored `FolderPath` with `BaseDBDrive`
+/// swapped for `CurrentDBDrive` (`replaceDrivePath`), not the raw column.
+#[test]
+fn a_drive_librarys_location_reads_under_the_drives_current_mount() {
+    let s = shell();
+    let track = track_id(3);
+    let location = s.state().location().unwrap();
+    fixture::point_at_audio(&location, 3, "/Volumes/Music/Tracks/a.mp3", 300).unwrap();
+    let writer = rbl_db::write::Writer::open(location, s._dir.path().join("drive-backups")).unwrap();
+    writer
+        .library()
+        .connection()
+        .execute("UPDATE djmdProperty SET BaseDBDrive = '/Volumes/Music/', CurrentDBDrive = '/Volumes/Music 1/'", [])
+        .unwrap();
+    drop(writer);
+
+    // On Windows a fixture folder off the default sits on a lettered drive,
+    // which rekordbox takes as the current drive instead.
+    let expected = if cfg!(windows) {
+        format!("{}/Tracks/a.mp3", &s._dir.path().to_string_lossy()[..2])
+    } else {
+        "/Volumes/Music 1/Tracks/a.mp3".to_owned()
+    };
+    let record = run(details::track_details(s.state(), track.clone())).unwrap();
+    assert_eq!(record.path, expected);
+
+    let (view, _) = s.open(collection_spec());
+    let rows = run(commands::fetch_rows(s.state(), view, 0, commands::MAX_ROWS, Some(vec!["location".into()]))).unwrap();
+    let row = rows.iter().find(|r| r.id == track).unwrap();
+    assert_eq!(row.extra.as_ref().unwrap()["location"], expected.as_str());
 }
 
 #[test]
@@ -976,7 +1230,7 @@ fn an_imported_file_goes_into_a_playlist_and_plays_on_a_deck() {
     assert!(s.sink.lock().unwrap().is_none());
     assert!(!s.deck_state().a.loaded);
 
-    run(commands::deck_load(s.handle(), s.state(), s.player(), "a".into(), id.clone(), 1)).unwrap();
+    run(commands::deck_load(s.handle(), s.state(), s.player(), s.preview(), "a".into(), id.clone(), 1)).unwrap();
     let loaded = s.pull_until("the deck to load", |t| t.a.loaded);
     assert_eq!(loaded.sample_rate, RATE);
     assert_eq!(loaded.a.total_frames, u64::from(RATE) * 2);
@@ -986,7 +1240,7 @@ fn an_imported_file_goes_into_a_playlist_and_plays_on_a_deck() {
     assert!(!loaded.b.loaded, "the other deck is untouched");
 
     // Playing moves the clock; pausing stops it where it is.
-    run(commands::deck_play(s.handle(), s.player(), "a".into())).unwrap();
+    run(commands::deck_play(s.handle(), s.player(), s.preview(), "a".into())).unwrap();
     let playing = s.pull_until("the playhead to move", |t| t.a.frames > 4_096);
     assert!(playing.a.playing);
     run(commands::deck_pause(s.player(), "a".into())).unwrap();
@@ -1019,10 +1273,72 @@ fn a_track_whose_file_is_gone_is_refused_at_load_rather_than_failing_later() {
     let s = shell();
     // The fixture's tracks point at files that do not exist. That is caught
     // when the deck is asked for one, not by the engine mid-play.
-    let err = run(commands::deck_load(s.handle(), s.state(), s.player(), "a".into(), "no-such-track".into(), 1))
+    let err = run(commands::deck_load(s.handle(), s.state(), s.player(), s.preview(), "a".into(), "no-such-track".into(), 1))
         .unwrap_err();
     assert_eq!(err.kind, ErrorKind::NotFound);
     assert!(s.sink.lock().unwrap().is_none(), "the audio output was not opened for it");
+}
+
+/// rekordbox opens a track only when its file is there, and otherwise says
+/// "Load error. The file could not be found." in the status bar and leaves
+/// the deck alone [OBS static, rekordbox 7.2.19
+/// `UiPlayer::handleMessageDragAndDrop` @0x101abadc4/0x101abb0f4].
+#[test]
+fn a_library_track_whose_file_is_gone_is_refused_in_rekordboxs_words() {
+    let s = shell();
+    let err = run(commands::deck_load(s.handle(), s.state(), s.player(), s.preview(), "a".into(), track_id(0), 1))
+        .unwrap_err();
+    assert_eq!(err.kind, ErrorKind::NotFound);
+    assert_eq!(err.message, "Load error. The file could not be found.");
+    assert!(s.sink.lock().unwrap().is_none(), "the audio output was not opened for it");
+    assert!(!s.deck_state().a.loaded);
+}
+
+/// Relocate refuses a file the collection already holds, writing nothing,
+/// as rekordbox's `MissingFileTable::showFileChooser` does ("This file is
+/// already in the collection.") [OBS static @0x1012a8408].
+#[test]
+fn relocate_refuses_a_file_the_collection_already_holds() {
+    let s = shell();
+    let held = write_wav(&s._dir.path().join("held.wav"), 1).display().to_string();
+    let report = run(commands::import_files(s.handle(), s.state(), vec![held.clone()])).unwrap();
+    assert_eq!(report.imported, 1);
+    let before = s.state().library().unwrap().audio_path_of(&track_id(1)).map(str::to_owned);
+
+    let taken = run(commands::relocate_track(s.handle(), s.state(), track_id(1), held)).unwrap();
+    assert!(!taken, "refused");
+    assert_eq!(s.state().library().unwrap().audio_path_of(&track_id(1)).map(str::to_owned), before, "nothing written");
+
+    let free = write_wav(&s._dir.path().join("free.wav"), 1).display().to_string();
+    assert!(run(commands::relocate_track(s.handle(), s.state(), track_id(1), free.clone())).unwrap());
+    assert_eq!(s.state().library().unwrap().audio_path_of(&track_id(1)), Some(free.as_str()));
+}
+
+#[test]
+fn auto_analysis_is_offered_the_unanalysed_tracks_whose_files_are_there_a_page_at_a_time() {
+    let s = shell();
+    // The fixture's own tracks are analysed and their files are elsewhere;
+    // freshly imported files are not analysed yet.
+    let files: Vec<String> = ["a.wav", "b.wav", "c.wav"]
+        .iter()
+        .map(|name| write_wav(&s._dir.path().join(name), 1).display().to_string())
+        .collect();
+    let report = run(commands::import_files(s.handle(), s.state(), files)).unwrap();
+    assert_eq!(report.imported, 3);
+    let imported: Vec<String> = report.tracks.iter().map(|t| t.id.clone()).collect();
+    // One of them loses its file: there is nothing to analyse there.
+    std::fs::remove_file(s._dir.path().join("b.wav")).unwrap();
+
+    let first = run(commands::unanalysed_tracks(s.state(), 0, 1)).unwrap();
+    assert_eq!(first.tracks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), [imported[0].as_str()]);
+    assert_eq!(first.tracks[0].title, "a");
+    let from = first.next.expect("more to come");
+    let second = run(commands::unanalysed_tracks(s.state(), from, 1)).unwrap();
+    assert_eq!(second.tracks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), [imported[2].as_str()]);
+    assert_eq!(second.next, None, "the scan reached the end");
+
+    let err = run(commands::unanalysed_tracks(s.state(), 0, commands::MAX_ROWS + 1)).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Malformed);
 }
 
 #[test]
@@ -1039,24 +1355,149 @@ fn the_two_decks_play_independently_and_the_master_level_is_the_engine_s() {
     assert_eq!(report.imported, 2);
     let (id_a, id_b) = (report.tracks[0].id.clone(), report.tracks[1].id.clone());
 
-    run(commands::deck_load(s.handle(), s.state(), s.player(), "a".into(), id_a, 1)).unwrap();
-    run(commands::deck_load(s.handle(), s.state(), s.player(), "b".into(), id_b, 2)).unwrap();
+    run(commands::deck_load(s.handle(), s.state(), s.player(), s.preview(), "a".into(), id_a, 1)).unwrap();
+    run(commands::deck_load(s.handle(), s.state(), s.player(), s.preview(), "b".into(), id_b, 2)).unwrap();
     s.pull_until("both decks to load", |t| t.a.loaded && t.b.loaded);
 
-    run(commands::set_master_level(s.handle(), s.player(), 0.5)).unwrap();
+    run(commands::set_master_level(s.handle(), s.player(), s.preview(), 0.5)).unwrap();
     assert!((s.deck_state().master - 0.5).abs() < 1e-6);
 
-    run(commands::deck_play(s.handle(), s.player(), "b".into())).unwrap();
+    run(commands::deck_play(s.handle(), s.player(), s.preview(), "b".into())).unwrap();
     let tick = s.pull_until("deck B to move", |t| t.b.frames > 4_096);
     assert!(tick.b.playing);
     assert!(!tick.a.playing);
     assert_eq!(tick.a.frames, 0, "deck A stays put while B plays");
 
     // Deck A's one second runs out; deck B is still going.
-    run(commands::deck_play(s.handle(), s.player(), "a".into())).unwrap();
+    run(commands::deck_play(s.handle(), s.player(), s.preview(), "a".into())).unwrap();
     let ended = s.pull_until("deck A to reach its end", |t| !t.a.playing && t.a.frames > 0);
     assert!(ended.b.playing);
     assert!(ended.b.frames > ended.a.frames);
+}
+
+#[test]
+fn a_waveform_click_previews_the_track_without_loading_a_deck() {
+    let s = shell();
+    let a = write_wav(&s._dir.path().join("deck.wav"), 3);
+    let b = write_wav(&s._dir.path().join("preview.wav"), 4);
+    let report = run(commands::import_files(
+        s.handle(),
+        s.state(),
+        vec![a.display().to_string(), b.display().to_string()],
+    ))
+    .unwrap();
+    let (on_deck, previewed) = (report.tracks[0].id.clone(), report.tracks[1].id.clone());
+
+    // Nothing previewed yet: no preview output opened, and an idle state.
+    assert_eq!(s.preview_state(), PreviewStateDto { track: None, playing: false, position_ms: 0.0, duration_ms: 0.0 });
+    assert!(s.preview_sink.lock().unwrap().is_none());
+
+    // Deck A is playing something else.
+    run(commands::deck_load(s.handle(), s.state(), s.player(), s.preview(), "a".into(), on_deck.clone(), 1)).unwrap();
+    s.pull_until("deck A to load", |t| t.a.loaded);
+    run(commands::deck_play(s.handle(), s.player(), s.preview(), "a".into())).unwrap();
+    s.pull_until("deck A to play", |t| t.a.playing && t.a.frames > 0);
+
+    // A click halfway across the second track's waveform.
+    run(commands::preview_play(s.handle(), s.state(), s.player(), s.preview(), previewed.clone(), 2_000.0)).unwrap();
+    // rekordbox outside PERFORMANCE mode pauses the decks for a preview.
+    let decks = s.pull_until("deck A to pause", |t| !t.a.playing);
+    assert_eq!(decks.a.load_id, 1, "the deck keeps its own track; the preview did not load onto it");
+    let playing = s.pull_preview_until("the preview to move past the click", |p| p.playing && p.position_ms > 2_050.0);
+    assert_eq!(playing.track.as_deref(), Some(previewed.as_str()));
+    assert!((playing.duration_ms - 4_000.0).abs() < 1.0);
+    assert!(playing.position_ms < 3_000.0, "started at the click, not the top: {playing:?}");
+
+    // A click on the same track moves it rather than reloading it.
+    run(commands::preview_play(s.handle(), s.state(), s.player(), s.preview(), previewed.clone(), 500.0)).unwrap();
+    let moved = s.pull_preview_until("the preview to move back", |p| p.playing && p.position_ms < 1_500.0);
+    assert!(moved.position_ms >= 500.0);
+
+    // Stopped where it is.
+    run(commands::preview_stop(s.preview())).unwrap();
+    s.pull_preview_until("the preview to stop", |p| !p.playing);
+
+    // A track whose file is not there is refused, as rekordbox refuses it.
+    std::fs::remove_file(&a).unwrap();
+    let err = run(commands::preview_play(s.handle(), s.state(), s.player(), s.preview(), on_deck, 0.0)).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::NotFound);
+}
+
+/// rekordbox outside PERFORMANCE mode stops its preview when a deck plays
+/// (`PreviewComponent::timerCallback`) and when a track is loaded onto a deck
+/// (`ListViewer::loadTrack`). rbxport left the preview playing under the deck,
+/// so the two were heard over each other (#242).
+#[test]
+fn a_deck_that_plays_or_loads_stops_the_preview() {
+    let s = shell();
+    let a = write_wav(&s._dir.path().join("deck.wav"), 3);
+    // Long enough that a preview left playing would not run out by itself
+    // while the test waits for it to stop.
+    let b = write_wav(&s._dir.path().join("preview.wav"), 60);
+    let report = run(commands::import_files(
+        s.handle(),
+        s.state(),
+        vec![a.display().to_string(), b.display().to_string()],
+    ))
+    .unwrap();
+    let (on_deck, previewed) = (report.tracks[0].id.clone(), report.tracks[1].id.clone());
+    let preview = |at: f64| {
+        run(commands::preview_play(s.handle(), s.state(), s.player(), s.preview(), previewed.clone(), at)).unwrap();
+        s.pull_preview_until("the preview to play", |p| p.playing && p.position_ms > at);
+    };
+    // Stopped by the deck, well before the preview's own end.
+    let stopped_by = |what: &str| {
+        let stopped = s.pull_preview_until(what, |p| !p.playing);
+        assert!(stopped.position_ms < 30_000.0, "{what}: the preview ran on to {stopped:?}");
+        stopped
+    };
+
+    // Loading a deck while the preview plays stops it.
+    preview(0.0);
+    run(commands::deck_load(s.handle(), s.state(), s.player(), s.preview(), "a".into(), on_deck, 1)).unwrap();
+    let stopped = stopped_by("loading deck A to stop the preview");
+    assert_eq!(stopped.track.as_deref(), Some(previewed.as_str()), "stopped, not forgotten");
+    s.pull_until("deck A to load", |t| t.a.loaded);
+
+    // Playing a deck while the preview plays stops it, and the deck plays.
+    preview(1_000.0);
+    run(commands::deck_play(s.handle(), s.player(), s.preview(), "a".into())).unwrap();
+    stopped_by("deck A's Play to stop the preview");
+    s.pull_until("deck A to play", |t| t.a.playing && t.a.frames > 0);
+
+    // A play held for the master's beat is a deck playing too.
+    preview(2_000.0);
+    s.pull_until("the preview to pause deck A", |t| !t.a.playing);
+    run(commands::deck_play_after(s.handle(), s.player(), s.preview(), "a".into(), 50.0)).unwrap();
+    stopped_by("deck A's held Play to stop the preview");
+}
+
+#[test]
+fn the_preview_follows_the_master_knob_and_limiter() {
+    let s = shell();
+    let a = write_wav(&s._dir.path().join("preview.wav"), 4);
+    let report = run(commands::import_files(s.handle(), s.state(), vec![a.display().to_string()])).unwrap();
+    let track = report.tracks[0].id.clone();
+
+    // The knob was turned down before any deck opened the device: the
+    // preview starts at that level rather than at full (#207).
+    s.player().set_master_level(0.25);
+    assert!(s.player().opened().is_none());
+    run(commands::preview_play(s.handle(), s.state(), s.player(), s.preview(), track, 0.0)).unwrap();
+    s.pull_preview_until("the preview to play", |p| p.playing && p.position_ms > 0.0);
+    let engine = s.preview().opened().expect("the preview opened its engine");
+    assert!((engine.master().gain() - 0.25).abs() < 1e-6, "started at {}", engine.master().gain());
+
+    // Turning the knob while it plays turns the preview too.
+    run(commands::set_master_level(s.handle(), s.player(), s.preview(), 0.6)).unwrap();
+    assert!((engine.master().gain() - 0.6).abs() < 1e-6, "followed to {}", engine.master().gain());
+
+    // And the limiter set on the decks is the preview's as well.
+    let wanted = rbxport_lib::dto::LimiterDto { input_gain_db: 3.0, enabled: true, ceiling_db: -1.0, release_ms: 120.0 };
+    let set = run(commands::set_master_limiter(s.player(), s.preview(), wanted)).unwrap();
+    assert!(engine.limiter().enabled());
+    assert!((engine.limiter().ceiling_db() - set.ceiling_db).abs() < 1e-6);
+    assert!((engine.limiter().input_gain_db() - set.input_gain_db).abs() < 1e-6);
 }
 
 #[test]
@@ -1195,6 +1636,31 @@ fn export_track_puts_a_track_on_a_stick_by_itself_and_a_sync_keeps_it_there() {
 }
 
 #[test]
+fn a_stick_pulled_during_a_sync_is_reported_as_disconnected() {
+    let s = shell();
+    let audio = s._dir.path().join("Pulled.wav");
+    write_wav(&audio, 2);
+    let report = run(commands::import_files(s.handle(), s.state(), vec![audio.display().to_string()])).unwrap();
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), playlist_id(1), vec![report.tracks[0].id.clone()])).unwrap();
+    let stick = tempfile::tempdir().unwrap();
+    let mount = stick.path().join("USB");
+    std::fs::create_dir_all(&mount).unwrap();
+    // The stick goes away as soon as the copy starts.
+    let pulled = mount.clone();
+    s.app.listen("export:progress", move |event| {
+        if event.payload().contains("\"copying\"") || event.payload().contains("\"checking\"") {
+            let _ = std::fs::remove_dir_all(&pulled);
+        }
+    });
+    let reports = run(commands::sync_devices(
+        s.handle(), s.state(), vec![playlist_id(1)], vec![mount.display().to_string()], None, None, None, None, None,
+    ))
+    .unwrap();
+    let error = reports[0].error.as_deref().expect("the sync failed");
+    assert!(error.starts_with("The USB was disconnected during the sync."), "{error}");
+}
+
+#[test]
 fn a_sync_writes_the_same_playlists_to_every_stick_and_each_stick_remembers_them() {
     let s = shell();
     // One real file in playlist 1, so there is something to copy; the
@@ -1296,6 +1762,53 @@ fn a_sync_writes_the_same_playlists_to_every_stick_and_each_stick_remembers_them
 }
 
 #[test]
+fn exporting_a_folder_writes_the_folder_with_its_playlists_inside() {
+    use rbxport_lib::dto::{SmartConditionDto, SmartRuleDto};
+    let s = shell();
+    let audio = s._dir.path().join("Folder Song.wav");
+    write_wav(&audio, 2);
+    let report = run(commands::import_files(s.handle(), s.state(), vec![audio.display().to_string()])).unwrap();
+    let song = report.tracks[0].id.clone();
+
+    run(commands::create_folder(s.handle(), s.state(), "Set".into(), ROOT.into())).unwrap();
+    let set = s.node("Set");
+    run(commands::create_playlist(s.handle(), s.state(), "Inside".into(), set.id.clone())).unwrap();
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), s.node("Inside").id, vec![song])).unwrap();
+    run(commands::create_folder(s.handle(), s.state(), "Later".into(), set.id.clone())).unwrap();
+    let rule = SmartRuleDto {
+        logic: "all".to_owned(),
+        conditions: vec![SmartConditionDto {
+            property: "name".to_owned(), operator: "11".to_owned(), left: "Folder Song".to_owned(), right: String::new(), unit: String::new(),
+        }],
+    };
+    run(commands::create_smart_playlist(s.handle(), s.state(), "Songs".into(), set.id.clone(), rule)).unwrap();
+
+    let stick = tempfile::tempdir().unwrap();
+    let written = run(commands::export_playlist(
+        s.handle(), s.state(), set.id.clone(), stick.path().display().to_string(), None, None, None,
+    ))
+    .unwrap();
+    assert_eq!(written.tracks, 1, "one track, however many playlists hold it");
+
+    let snapshot = rbl_export::snapshot::Snapshot::read(stick.path()).unwrap();
+    for library in [snapshot.one.expect("exportLibrary.db"), snapshot.legacy.expect("export.pdb")] {
+        let named = |name: &str| library.playlists.iter().find(|p| p.name == name).unwrap_or_else(|| panic!("no {name} in {:?}", library.playlists));
+        let set = named("Set");
+        assert!(set.folder, "the folder is a folder on the stick, not an empty playlist");
+        assert_eq!(set.parent, 0);
+        let later = named("Later");
+        assert!(later.folder && later.parent == set.id, "an empty folder under it keeps its place");
+        for name in ["Inside", "Songs"] {
+            let playlist = named(name);
+            assert!(!playlist.folder);
+            assert_eq!(playlist.parent, set.id);
+            assert_eq!(playlist.tracks.len(), 1, "{name}");
+        }
+        assert_eq!(library.playlists.len(), 4);
+    }
+}
+
+#[test]
 fn an_intelligent_playlist_is_made_from_a_rule_and_its_rule_is_edited() {
     use rbxport_lib::dto::{SmartConditionDto, SmartRuleDto};
     let s = shell();
@@ -1337,9 +1850,38 @@ fn an_intelligent_playlist_is_made_from_a_rule_and_its_rule_is_edited() {
         s.state(),
         "Nope".to_owned(),
         ROOT.to_owned(),
-        SmartRuleDto { logic: "all".to_owned(), conditions: vec![condition("myTag", "1", "x", "")] }
+        SmartRuleDto { logic: "all".to_owned(), conditions: vec![condition("hotCueCount", "1", "x", "")] }
     ))
     .is_err());
+}
+
+#[test]
+fn an_intelligent_playlist_on_a_my_tag_holds_the_tracks_carrying_it() {
+    // Issue #84: a rule on a My Tag opened empty and read back with no
+    // property, which the editor drew as "Album artist".
+    use rbl_db::fixture::MY_TAG_PEAK;
+    use rbxport_lib::dto::{SmartConditionDto, SmartRuleDto};
+    let s = shell();
+    run(details::set_my_tags(s.handle(), s.state(), track_id(3), vec![MY_TAG_PEAK.to_owned()])).unwrap();
+    run(details::set_my_tags(s.handle(), s.state(), track_id(5), vec![MY_TAG_PEAK.to_owned()])).unwrap();
+    let rule = SmartRuleDto {
+        logic: "all".to_owned(),
+        conditions: vec![SmartConditionDto {
+            property: "myTag".to_owned(),
+            operator: "8".to_owned(),
+            left: MY_TAG_PEAK.to_owned(),
+            right: String::new(),
+            unit: String::new(),
+        }],
+    };
+    run(commands::create_smart_playlist(s.handle(), s.state(), "Peak".to_owned(), ROOT.to_owned(), rule)).unwrap();
+    let node = s.node("Peak");
+    assert_eq!(s.playlist_rows(&node.id).len(), 2);
+    let read = run(commands::smart_rule(s.state(), node.id.clone())).unwrap();
+    assert_eq!(
+        (read.conditions[0].property.as_str(), read.conditions[0].operator.as_str(), read.conditions[0].left.as_str()),
+        ("myTag", "8", MY_TAG_PEAK)
+    );
 }
 
 #[test]
@@ -1386,4 +1928,64 @@ fn export_selection_materializes_an_intelligent_playlist_from_its_rule() {
     assert_eq!(missing.len(), 1);
     assert_eq!(missing[0].title, "Smart Export Match");
     assert_eq!(missing[0].path, audio.display().to_string());
+}
+
+/// A folder from Finder dropped onto the Playlists root: one playlist named
+/// after it with the whole subtree flattened in, as rekordbox 7.2.19 does
+/// (`TreeViewer::treeMessageImportExternalFoldersToList`) [OBS, static]; a
+/// second drop of a same-named folder asks first; a loose file is ignored.
+#[test]
+fn a_folder_dropped_on_the_playlists_root_becomes_a_playlist() {
+    let s = shell();
+    let folder = s._dir.path().join("Warm Up");
+    std::fs::create_dir_all(folder.join("Extras")).unwrap();
+    write_wav(&folder.join("b.wav"), 1);
+    write_wav(&folder.join("a.wav"), 1);
+    write_wav(&folder.join("Extras/c.wav"), 1);
+    let path = folder.display().to_string();
+
+    let report =
+        run(commands::import_folder_playlist(s.handle(), s.state(), path.clone(), "root".into(), None, None)).unwrap();
+    assert!(report.folder);
+    assert_eq!(report.name, "Warm Up");
+    assert_eq!(report.imported, 3);
+    assert_eq!(report.conflict, None);
+    let playlist = report.playlist.clone().unwrap();
+    let node = s.node("Warm Up");
+    let top = s.node("Playlist 0").depth;
+    assert_eq!((node.id.as_str(), node.kind, node.depth), (playlist.as_str(), "playlist", top));
+    let titles: Vec<String> = s.playlist_rows(&playlist).into_iter().map(|r| r.title).collect();
+    assert_eq!(titles, ["a", "b", "c"]);
+
+    // The same folder again: nothing written until the replacement is agreed.
+    let asked =
+        run(commands::import_folder_playlist(s.handle(), s.state(), path.clone(), "root".into(), None, None)).unwrap();
+    assert_eq!(asked.conflict.as_deref(), Some(playlist.as_str()));
+    assert_eq!(asked.playlist, None);
+    let replaced = run(commands::import_folder_playlist(
+        s.handle(),
+        s.state(),
+        path,
+        "root".into(),
+        Some(playlist.clone()),
+        asked.at,
+    ))
+    .unwrap();
+    assert_eq!(replaced.existing, 3, "the files are reused, not imported twice");
+    let new_id = replaced.playlist.unwrap();
+    assert_ne!(new_id, playlist);
+    assert_eq!(s.tree().iter().filter(|n| n.name == "Warm Up").count(), 1);
+    assert_eq!(s.playlist_rows(&new_id).len(), 3);
+
+    let loose = run(commands::import_folder_playlist(
+        s.handle(),
+        s.state(),
+        folder.join("a.wav").display().to_string(),
+        "root".into(),
+        None,
+        None,
+    ))
+    .unwrap();
+    assert!(!loose.folder);
+    assert_eq!(loose.playlist, None);
 }

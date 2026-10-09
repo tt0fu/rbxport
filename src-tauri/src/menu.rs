@@ -95,8 +95,11 @@ fn build_with_labels<R: Runtime>(app: &AppHandle<R>, labels: &Labels) -> tauri::
     let import_folder = MenuItemBuilder::with_id("import-folder", label(labels, "Import Folder…"))
         .accelerator("CmdOrCtrl+Shift+O")
         .build(app)?;
+    // rekordbox's own wording and place: File › Display All Missing Files,
+    // between Import and the library items, opens the Missing File Manager
+    // [OBS rekordbox 7.2.14, issue #201].
     let missing =
-        MenuItemBuilder::with_id("missing", label(labels, "Missing File Manager")).build(app)?;
+        MenuItemBuilder::with_id("missing", label(labels, "Display All Missing Files")).build(app)?;
     // rekordbox's own two, worded as its File menu words them.
     let import_xml = MenuItemBuilder::with_id("import-xml", label(labels, "Import rekordbox xml…"))
         .build(app)?;
@@ -146,8 +149,10 @@ fn build_with_labels<R: Runtime>(app: &AppHandle<R>, labels: &Labels) -> tauri::
         .item(&import_folder)
         .item(&import_xml)
         .item(&import_itunes)
-        .item(&export_xml)
+        .separator()
         .item(&missing)
+        .separator()
+        .item(&export_xml)
         .separator()
         .item(&PredefinedMenuItem::close_window(
             app,

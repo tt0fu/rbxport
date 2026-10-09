@@ -117,3 +117,83 @@ test("a native file drag below the last row is accepted and appends the track", 
   expect(accepted).toEqual({ over: true, drop: true });
   await expect.poll(titles).toEqual([...before.slice(1), before[0]]);
 });
+
+/**
+ * A folder from Finder dropped onto the Playlists root or a playlist folder
+ * becomes a playlist named after it, as in rekordbox 7
+ * (`TreeViewer::treeMessageImportExternalFoldersToList`). The browser has no
+ * file system, so the drop carries paths the way other desktop hosts do, and
+ * the mock makes the playlist empty.
+ */
+const folderDrop = (page: import("@playwright/test").Page, paths: string[]) =>
+  page.evaluateHandle((paths) => {
+    const transfer = new DataTransfer();
+    for (const path of paths) {
+      const name = path.split("/").pop() ?? path;
+      transfer.items.add(new File([], name));
+    }
+    // `dataTransfer.files` hands back the File objects added; give each the
+    // path a desktop host would carry. Hold on to them: WebKit may drop an
+    // unreferenced File wrapper, and the `path` with it.
+    const files = Array.from(transfer.files);
+    files.forEach((file, i) => Object.defineProperty(file, "path", { value: paths[i] }));
+    (window as unknown as { __droppedFolders?: File[][] }).__droppedFolders = [
+      ...((window as unknown as { __droppedFolders?: File[][] }).__droppedFolders ?? []),
+      files,
+    ];
+    return transfer;
+  }, paths);
+
+test("a folder dropped on the Playlists root becomes a playlist named after it", async ({ page }) => {
+  await page.goto("/?writable=1");
+  const root = page.getByRole("treeitem").filter({ hasText: /^Playlists/ }).first();
+  await expect(root).toHaveAttribute("data-file-drop-playlist", "playlists");
+  const drop = await folderDrop(page, ["/Music/Friday Set"]);
+  await root.dispatchEvent("dragover", { dataTransfer: drop });
+  await root.dispatchEvent("drop", { dataTransfer: drop });
+  await expect(page.getByRole("contentinfo")).toContainText("Made playlists: Friday Set.");
+  const made = page.getByRole("treeitem").filter({ hasText: "Friday Set" });
+  await expect(made).toHaveCount(1);
+  await expect(made).toHaveAttribute("data-kind", "playlist");
+
+  // Again: rekordbox's question, answered yes by the mock, replaces it.
+  const again = await folderDrop(page, ["/Music/Friday Set"]);
+  await root.dispatchEvent("drop", { dataTransfer: again });
+  await expect(page.getByRole("contentinfo")).toContainText("Made playlists: Friday Set.");
+  await expect(page.getByRole("treeitem").filter({ hasText: "Friday Set" })).toHaveCount(1);
+});
+
+test("a folder dropped on a playlist folder lands inside it; loose files are ignored", async ({ page }) => {
+  await page.goto("/?writable=1");
+  const folder = page.locator('[role="treeitem"][data-kind="folder"]').first();
+  const id = await folder.getAttribute("data-file-drop-playlist");
+  expect(id).toBeTruthy();
+  const drop = await folderDrop(page, ["/Music/Warm Up"]);
+  await folder.dispatchEvent("drop", { dataTransfer: drop });
+  await expect(page.getByRole("contentinfo")).toContainText("Made playlists: Warm Up.");
+  const made = page.getByRole("treeitem").filter({ hasText: "Warm Up" });
+  const depth = async (row: import("@playwright/test").Locator) =>
+    row.evaluate((el) => Number.parseFloat((el as HTMLElement).style.paddingLeft));
+  expect(await depth(made)).toBeGreaterThan(await depth(folder));
+
+  const loose = await folderDrop(page, ["/Music/track.mp3"]);
+  await folder.dispatchEvent("drop", { dataTransfer: loose });
+  await expect(page.getByRole("contentinfo")).toContainText(
+    "Drop folders onto Playlists or a playlist folder to make playlists of them.",
+  );
+});
+
+test("folders dropped together all take the drop's place, so the last lands first", async ({ page }) => {
+  await page.goto("/?writable=1");
+  const folder = page.locator('[role="treeitem"][data-kind="folder"]').first();
+  const drop = await folderDrop(page, ["/Music/Drop A", "/Music/Drop B"]);
+  await folder.dispatchEvent("drop", { dataTransfer: drop });
+  await expect(page.getByRole("contentinfo")).toContainText("Made playlists: Drop A, Drop B.");
+  // rekordbox moves each new list to the drop's one insert index
+  // (rekordboxDBController::createNewList), so B ends up before A.
+  const names = await page.getByRole("treeitem").allTextContents();
+  const a = names.findIndex((name) => name.includes("Drop A"));
+  const b = names.findIndex((name) => name.includes("Drop B"));
+  expect(a).toBeGreaterThan(-1);
+  expect(b).toBe(a - 1);
+});

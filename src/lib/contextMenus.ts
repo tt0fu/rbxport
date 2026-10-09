@@ -32,10 +32,14 @@ export type TrackAction =
   | "showInformation"
   | "showInFinder"
   | "loadPlayer1"
-  | "loadPlayer2";
+  | "loadPlayer2"
+  | "autoRelocate"
+  | "relocate"
+  /** A device track into one of its own library's playlists. */
+  | `deviceAddToPlaylist:${string}`;
 
 export type TreeAction =
-  | "export"
+  | `exportTo:${string}`
   | "exportM3u8"
   | "exportTxt"
   | "createPlaylist"
@@ -79,6 +83,11 @@ export interface MenuEntry<A> {
   items?: readonly MenuRow<A>[];
   /** A rule beyond "we have it": no playlist to remove from, and so on. */
   needs?: "playlist" | "history" | "file" | "loose" | "track";
+  /**
+   * Live over files the library does not hold as well: the files are
+   * imported first, then the entry runs on the tracks they became.
+   */
+  importsLoose?: boolean;
   /** In a submenu of choices, the one in force: drawn with a tick. */
   checked?: boolean;
 }
@@ -106,6 +115,16 @@ export type MenuRow<A> = MenuEntry<A> | typeof SEPARATOR;
  * the waveforms, the BPM and the key — so it is a write, greyed while
  * rekordbox holds the file. `Import To Collection` is live over a file the
  * Explorer lists and greyed over a track, which is already in.
+ *
+ * What is live follows the rows' state, not the view [OBS rekordbox 7,
+ * Winrig 2026-10-08, issue #105]. In the Explorer, a file the collection
+ * holds gets a track's menu: Import To Collection greyed, Analyze Track,
+ * Analysis Lock and Remove from Collection live. A file it does not hold
+ * gets the reverse of those four, and Add To Playlist stays live, importing
+ * the file on the way in. rekordbox also leaves Add To Tag List, Reload Tag,
+ * Export Track, Reset DJ Play Count and Show information live over such a
+ * file; what each does to it there has not been observed [UNKNOWN], so
+ * they stay greyed here until it has.
  */
 export const TRACK_MENU: readonly MenuRow<TrackAction>[] = [
   { label: "Load", action: null, submenu: true },
@@ -168,6 +187,23 @@ export const TRACK_MENU: readonly MenuRow<TrackAction>[] = [
   },
 ];
 
+/** The heading over `MISSING_TRACK_MENU`. */
+export const MISSING_TRACK_TITLE = "File is Missing";
+
+/**
+ * Right-clicking a track whose file is missing: rekordbox's own short menu
+ * in place of `TRACK_MENU`, under the heading "File is Missing" [OBS
+ * rekordbox 7.2.14, Winrig chris-win11 2026-10-08, issue #201, and the
+ * reporter's rekordbox on macOS]. A cloud-shared track whose file is on
+ * another computer is not this: rekordbox marks it `?` and keeps the full
+ * menu, with Load greyed [OBS same session].
+ */
+export const MISSING_TRACK_MENU: readonly MenuRow<TrackAction>[] = [
+  { label: "Auto Relocate", action: "autoRelocate" },
+  { label: "Relocate", action: "relocate" },
+  { label: "Remove from Collection", action: "removeFromCollection" },
+];
+
 /**
  * Right-clicking the tree, top to bottom as the capture has it
  * (docs/screenshots context-menu-tree@2x, over a playlist).
@@ -190,7 +226,19 @@ export const TRACK_MENU: readonly MenuRow<TrackAction>[] = [
  * rows would promise a feature that is not coming, which is a different
  * thing from one not built yet.
  */
-export function treeMenu(kind: "playlist" | "smartPlaylist" | "folder" | "collection"): readonly MenuRow<TreeAction>[] {
+export function treeMenu(
+  kind: "playlist" | "smartPlaylist" | "folder" | "collection",
+  devices: readonly MenuTarget[] = [],
+): readonly MenuRow<TreeAction>[] {
+  // `Export Playlist` and `Export Folder` list the connected drives and write
+  // to the one chosen; there is no folder picker behind them [OBS rekordbox 7
+  // on Windows, Winrig 2026-10-08, issue #142: the submenu held one row,
+  // "D:ssd", for the one drive besides C:]. With nothing connected the arrow
+  // is greyed over nothing, as Export Track's is [ASSUME: the capture had a
+  // drive connected].
+  const exportRow = (label: string): MenuEntry<TreeAction> => devices.length > 0
+    ? { label, action: null, submenu: true, items: devices.map((d) => ({ label: d.name, action: `exportTo:${d.id}` as const })) }
+    : { label, action: null, submenu: true };
   if (kind === "collection") {
     return [
       { label: "Create New Playlist", action: "createPlaylist" },
@@ -205,7 +253,7 @@ export function treeMenu(kind: "playlist" | "smartPlaylist" | "folder" | "collec
     // name order. Rename is not in it either (a double click on the row);
     // it is kept here beside Delete as on a playlist [ASSUME].
     return [
-      { label: "Export Folder", action: "export", submenu: true },
+      exportRow("Export Folder"),
       SEPARATOR,
       { label: "Create New Playlist", action: "createPlaylist" },
       { label: "Create New Folder", action: "createFolder" },
@@ -223,7 +271,7 @@ export function treeMenu(kind: "playlist" | "smartPlaylist" | "folder" | "collec
   // An intelligent playlist is exported, renamed and deleted like any other;
   // what it cannot do is take tracks by hand, which its rows never offer.
   return [
-    { label: "Export Playlist", action: "export", submenu: true },
+    exportRow("Export Playlist"),
     SEPARATOR,
     { label: "Create New Playlist", action: "createPlaylist" },
     ...(smart ? [{ label: "Edit Intelligent Playlist", action: "editSmartPlaylist" as const }] : []),
@@ -250,6 +298,94 @@ export function treeMenu(kind: "playlist" | "smartPlaylist" | "folder" | "collec
     },
     SEPARATOR,
     { label: "Add To Shortcut", action: "addToShortcut" },
+  ];
+}
+
+/** What the Devices tree's menus do over a stick's own playlists. */
+export type DeviceTreeAction = "deviceCreatePlaylist" | "deviceCreateFolder" | "deviceDelete";
+
+/**
+ * Right-clicking under a stick in the Devices tree: its Playlists heading, a
+ * folder, or a playlist of one of its libraries, top to bottom as rekordbox
+ * 7.2.14 draws them [OBS Winrig 2026-10-08, `parity/issue-186/rekordbox-02`,
+ * `-07` and `-18`; the folder's from `BrowsePopupMenuManager::
+ * showTreeViewPopupMenu` @0x1000efa7c, static, rekordbox 7.2.11 macOS].
+ *
+ * Live are the edits this app makes to a stick: Create New Playlist and
+ * Create New Folder, and Delete. There is no Rename row: rekordbox renames
+ * a stick's playlist or folder only by clicking it once selected
+ * (`FolderListTreeViewItem::isEditableItem` @0x1016c7868), and so does the
+ * tree here. Import, Delete All, Sort Items, artwork, export to a file and
+ * shortcuts are drawn greyed.
+ */
+export function deviceTreeMenu(kind: "devicePlaylists" | "deviceFolder" | "devicePlaylist"): readonly MenuRow<DeviceTreeAction>[] {
+  const create: MenuRow<DeviceTreeAction>[] = [
+    { label: "Create New Playlist", action: "deviceCreatePlaylist" },
+    { label: "Create New Folder", action: "deviceCreateFolder" },
+  ];
+  if (kind === "devicePlaylists") {
+    return [
+      ...create,
+      SEPARATOR,
+      { label: "Import Folder", action: null },
+      SEPARATOR,
+      { label: "Delete All", action: null },
+      SEPARATOR,
+      { label: "Sort Items", action: null },
+      SEPARATOR,
+      { label: "Add To Shortcut", action: null },
+    ];
+  }
+  if (kind === "deviceFolder") {
+    return [
+      ...create,
+      SEPARATOR,
+      { label: "Import Folder", action: null },
+      SEPARATOR,
+      { label: "Delete Folder", action: "deviceDelete" },
+      SEPARATOR,
+      { label: "Sort Items", action: null },
+      SEPARATOR,
+      { label: "Add To Shortcut", action: null },
+    ];
+  }
+  return [
+    { label: "Add Artwork", action: null },
+    SEPARATOR,
+    { label: "Import Playlist", action: null },
+    SEPARATOR,
+    { label: "Delete Playlist", action: "deviceDelete" },
+    SEPARATOR,
+    { label: "Export a playlist to a file", action: null, submenu: true },
+    SEPARATOR,
+    { label: "Add To Shortcut", action: null },
+  ];
+}
+
+/**
+ * Right-clicking tracks of a stick's own library, as rekordbox 7.2.14 draws
+ * it [OBS Winrig 2026-10-08, `parity/issue-186/rekordbox-09` under All
+ * Tracks and `-12` in a playlist]: Add To Playlist lists that library's
+ * playlists, and inside a playlist Remove from Playlist takes the tracks
+ * out. Delete Track, which takes the file off the stick, the waveform and
+ * collection rows and Show information are drawn greyed.
+ *
+ * rekordbox's submenu nests the library's folders; this one lists the
+ * playlists flat, as the collection's Add To Playlist here does.
+ */
+export function deviceTrackMenu(playlists: readonly MenuTarget[], inPlaylist: boolean): readonly MenuRow<TrackAction>[] {
+  const add: MenuEntry<TrackAction> = playlists.length > 0
+    ? { label: "Add To Playlist", action: null, submenu: true, items: playlists.map((p) => ({ label: p.name, action: `deviceAddToPlaylist:${p.id}` as const })) }
+    : { label: "Add To Playlist", action: null, submenu: true };
+  return [
+    add,
+    inPlaylist
+      ? { label: "Remove from Playlist", action: "removeFromPlaylist", needs: "playlist" }
+      : { label: "Delete Track", action: null },
+    { label: "Retrieve the waveform from collection", action: null },
+    { label: "Update Collection", action: null },
+    SEPARATOR,
+    { label: "Show information", action: null },
   ];
 }
 
@@ -379,10 +515,17 @@ const WRITES: ReadonlySet<string> = new Set([
   "reloadTag",
   "removeFromHistory",
   "removeFromCollection",
+  "autoRelocate",
+  "relocate",
   "createPlaylist",
   "createFolder",
   "rename",
   "delete",
+  // A stick's own library: rekordbox holds a mounted stick's database open,
+  // so these are refused alongside the library's own writes.
+  "deviceCreatePlaylist",
+  "deviceCreateFolder",
+  "deviceDelete",
 ]);
 
 /** Whether an entry can be clicked. Everything else is drawn and greyed. */
@@ -394,8 +537,10 @@ export function enabled<A extends string>(
   // having something under it that is.
   if (entry.items) return entriesOf(entry.items).some((row) => enabled(row, context));
   if (entry.action === null) return false;
-  if (context.readOnly && (WRITES.has(entry.action) || entry.action.startsWith("addToPlaylist:"))) return false;
-  if (context.loose === true && entry.needs !== "loose" && entry.needs !== "file") return entry.action.startsWith("loadPlayer");
+  if (context.readOnly && (WRITES.has(entry.action) || entry.action.startsWith("addToPlaylist:") || entry.action.startsWith("deviceAddToPlaylist:"))) return false;
+  if (context.loose === true && entry.needs !== "loose" && entry.needs !== "file" && entry.importsLoose !== true) {
+    return entry.action.startsWith("loadPlayer");
+  }
   if (entry.needs === "playlist") return context.inPlaylist;
   if (entry.needs === "history") return context.inHistory === true;
   if (entry.needs === "file") return context.hasFile;
@@ -403,7 +548,7 @@ export function enabled<A extends string>(
   return true;
 }
 
-/** A playlist the Add To Playlist submenu offers, and a stick Export Track offers. */
+/** A playlist the Add To Playlist submenu offers, and a stick Export Track and Export Playlist offer. */
 export interface MenuTarget {
   id: string;
   name: string;
@@ -430,7 +575,9 @@ export function trackMenuFor(
   devices: readonly MenuTarget[] = [],
   // Over the Tag List, "Remove from Playlist" is "Remove from Tag List"
   // [ASSUME: the capture is over a playlist].
-  options: { tagList?: boolean } = {},
+  // In the Explorer, rekordbox draws no Convert Memory Cues to Hot Cues row,
+  // over an imported file or a loose one [OBS 7, Winrig 2026-10-08].
+  options: { tagList?: boolean; explorer?: boolean } = {},
 ): readonly MenuRow<TrackAction>[] {
   const every: MenuRow<TrackAction>[] = [
     { label: "Load track to player 1", action: "loadPlayer1" },
@@ -440,14 +587,17 @@ export function trackMenuFor(
   const lists: MenuRow<TrackAction>[] = playlists.map((p) => ({
     label: p.name,
     action: `addToPlaylist:${p.id}` as const,
-    needs: "track" as const,
+    importsLoose: true,
   }));
   const sticks: MenuRow<TrackAction>[] = devices.map((d) => ({
     label: d.name,
     action: `exportTrack:${d.id}` as const,
     needs: "track" as const,
   }));
-  return TRACK_MENU.map((row) => {
+  const rows = options.explorer === true
+    ? TRACK_MENU.filter((row) => row === SEPARATOR || row.action !== "convertMemoryCues")
+    : TRACK_MENU;
+  return rows.map((row) => {
     if (row === SEPARATOR) return row;
     if (row.label === "Load" && decks.length > 0) return { ...row, items: decks };
     if (row.label === "Add To Playlist" && lists.length > 0) return { ...row, items: lists };
@@ -457,6 +607,44 @@ export function trackMenuFor(
     }
     return row;
   });
+}
+
+/** The removals the Delete key can stand for. */
+export type DeleteKeyAction =
+  | "removeFromCollection"
+  | "removeFromPlaylist"
+  | "removeFromHistory"
+  | "removeFromTagList";
+
+/**
+ * What the Delete key (or ⌫, Backspace) does to the selected tracks of a
+ * list showing `source`: the same removal as the menu entry for that list,
+ * over the whole selection, or `null` where it does nothing.
+ *
+ * rekordbox's track list sends both keys to `ListViewer::deleteKeyPressed`
+ * [OBS static, rekordbox 7.2.19 arm64: `CustomListBox::keyPressed`
+ * @0x100e7c6ac compares the key with `KeyPress::deleteKey` and
+ * `KeyPress::backspaceKey`]. That removes the selected rows from the Tag
+ * List, from a playlist or a history, and in the Collection asks first and
+ * passes every selected track to `DatabaseIF::removeFromCollection`
+ * (@0x1004069b8) [OBS static]. The manual says the same of the Collection
+ * (p.20, "Press the [Delete] key... Click [OK]") and of a playlist (p.39)
+ * [OBS rekordbox 7.2.18 manual]. Elsewhere — the Explorer, Related Tracks,
+ * a folder — this app has nothing to remove [ASSUME].
+ */
+export function deleteKeyAction(source: string): DeleteKeyAction | null {
+  switch (source) {
+    case "collection":
+      return "removeFromCollection";
+    case "playlist":
+      return "removeFromPlaylist";
+    case "history":
+      return "removeFromHistory";
+    case "tagList":
+      return "removeFromTagList";
+    default:
+      return null;
+  }
 }
 
 /** The entries of a menu, without its separators. */

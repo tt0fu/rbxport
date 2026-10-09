@@ -44,6 +44,11 @@ export interface RowDto {
    * the backend always sends it.
    */
   fileName?: string;
+  /**
+   * The file is not where the library says: rekordbox's `[!]` in the
+   * Attribute column. Sent only when true.
+   */
+  missing?: boolean;
   /** Extra database fields requested for visible browser columns. */
   extra?: Record<string, string | number | boolean>;
 }
@@ -58,14 +63,31 @@ export type TrackSource =
   /** Related Tracks: what goes with `track` under a criterion. An empty track lists nothing. */
   | { kind: "related"; track: string; criterion: RelatedCriterion }
   /** The Tag List, in its own order. */
-  | { kind: "tagList" };
+  | { kind: "tagList" }
+  /**
+   * A library on a USB stick, as the Devices tree opens it: one of its
+   * playlists, or all its tracks for playlist `"0"`. The rows come from the
+   * stick's own database. `revision` changes after an edit to the stick so
+   * the view is opened again; the backend does not read it.
+   */
+  | { kind: "device"; path: string; format: DeviceFormat; playlist: string; revision?: number };
 
 /** The Related Tracks section's criteria: rekordbox's own three. */
 export type RelatedCriterion = "bpmKey" | "genreRecent" | "artist" | "suggestion";
 
+/**
+ * The browser columns the backend can order by: every column rekordbox
+ * 7.2.11's own list sorts (its `BrowseHeaderManager::isSortableColumn`),
+ * except Hot Cue, whose rekordbox sort is by a field this column does not
+ * show. Each name is the column's own key.
+ */
 export type SortColumn =
   | "trackNo" | "title" | "artist" | "album" | "genre" | "label"
-  | "comment" | "bpm" | "key" | "duration" | "rating" | "dateAdded" | "releaseDate";
+  | "comment" | "bpm" | "key" | "duration" | "rating" | "djPlayCount"
+  | "dateAdded" | "releaseDate" | "size" | "year" | "sampleRate" | "bitrate"
+  | "color" | "fileName" | "location" | "composer" | "albumArtist" | "remixer"
+  | "originalArtist" | "mixName" | "discNo" | "trackNumber" | "fileType"
+  | "bitDepth" | "lyricist" | "dateCreated" | "publishTrackInfo" | "message";
 
 /**
  * What the backend sorts by. The columns, plus the key round the Camelot
@@ -110,7 +132,14 @@ export interface TreeNode {
     /** rekordbox's Tag List: its one temporary list, kept in the library. */
     | "tagList"
     /** A line of information in the tree, not a place: nothing opens when it is clicked. */
-    | "note";
+    | "note"
+    /**
+     * A USB stick's own library under its device row, as rekordbox's
+     * Devices tree has it: the library's heading (Device Library or
+     * OneLibrary), its All Tracks and Playlists headings, and its folders
+     * and playlists.
+     */
+    | "deviceLibrary" | "deviceAllTracks" | "devicePlaylists" | "deviceFolder" | "devicePlaylist";
   depth: number;
   /** Undefined for leaves. */
   expanded?: boolean;
@@ -124,10 +153,27 @@ export interface TreeNode {
 
 /** Why the library did not load at startup. */
 export type LibraryProblem =
-  /** No rekordbox library here at all; one can be made at `masterDb`. */
+  /** No library configured anywhere; one can be made at `masterDb`. */
   | { kind: "missing"; masterDb: string }
+  /**
+   * A library is configured at `masterDb`, not the default folder, and is
+   * not there, most often because its drive is not connected: rekordbox's
+   * "Cannot find Master Database" question. Nothing is made in its place;
+   * `useDefaultLibrary` switches to `defaultMasterDb`'s folder instead.
+   */
+  | { kind: "unavailable"; masterDb: string; defaultMasterDb: string }
   /** A library, or something in its place, that would not open. */
   | { kind: "failed"; message: string };
+
+/** One entry of Database management's drive list. */
+export interface DatabaseDrive {
+  /** The drive's name: its volume label, as rekordbox shows it. */
+  name: string;
+  /** The library's `master.db` on that drive. */
+  masterDb: string;
+  /** Whether it is the library open now. */
+  current: boolean;
+}
 
 export interface LibrarySummary {
   trackCount: number;
@@ -276,6 +322,26 @@ export interface Backend {
   createLibrary(): Promise<void>;
 
   /**
+   * The Yes of "Cannot find Master Database", once confirmed: sets
+   * rekordbox's library location to the default folder and loads what is
+   * there, or reports `missing` when there is nothing to load.
+   */
+  useDefaultLibrary(): Promise<void>;
+
+  /**
+   * Database management's drive list: the default drive when it holds a
+   * library, and every connected drive holding a rekordbox library.
+   */
+  databaseDrives(): Promise<DatabaseDrive[]>;
+
+  /**
+   * Switches to the library on a drive from `databaseDrives`, as choosing it
+   * in rekordbox's Database management does, and starts the app again on
+   * it. Rejects with the reason when it cannot.
+   */
+  switchLibrary(masterDb: string): Promise<void>;
+
+  /**
    * Fires after a cue edit with the id of the track whose cues changed.
    * A deck showing that track refetches its cues; nothing else has to move.
    */
@@ -343,6 +409,17 @@ export interface Backend {
   /** Adds these files to the library: the Explorer's Import To Collection. */
   importPaths(paths: string[]): Promise<ImportReport>;
   /**
+   * A folder from Finder or Explorer dropped onto the Playlists root or a
+   * playlist folder: one playlist under `parent` named after the folder,
+   * holding every audio file under it with subfolders flattened, as
+   * rekordbox does. A same-named sibling stops it with nothing written and
+   * comes back as `conflict`; call again with `replace` set to that id once
+   * the user agrees to replace it. `at` is the drop's insert index under
+   * `parent` (omitted: the end); rekordbox puts every folder of one drop at
+   * the same index, so pass each folder the `at` the previous one returned.
+   */
+  importFolderPlaylist(path: string, parent: string, replace?: string, at?: number | null): Promise<FolderPlaylistReport>;
+  /**
    * Export Loop As WAV: asks where, then writes the loop's stretch of the
    * track as a WAV. Resolves to the frames written, or null when cancelled.
    */
@@ -357,10 +434,18 @@ export interface Backend {
    * Imports a rekordbox XML collection chosen in the platform's file
    * dialog: its files into the library, its playlists, and the cues of each
    * track that landed. Null when the dialog is cancelled.
+   *
+   * When folders or playlists the file holds already stand in the library
+   * under the same parent with the same name, `confirmReplace` is asked
+   * first, as rekordbox asks: true replaces them with the file's, false
+   * imports nothing at all and resolves to null.
    */
-  importXml(): Promise<XmlImportReport | null>;
-  /** Asks for Music.app's Library.xml and imports its tracks and playlists. */
-  importItunes(): Promise<XmlImportReport | null>;
+  importXml(confirmReplace: ConfirmReplace): Promise<XmlImportReport | null>;
+  /**
+   * Asks for Music.app's Library.xml and imports its tracks and playlists,
+   * asking `confirmReplace` as {@link importXml} does.
+   */
+  importItunes(confirmReplace: ConfirmReplace): Promise<XmlImportReport | null>;
   /**
    * The iTunes / Music library at its usual place, for the Sync Manager's
    * iTunes column. Null when no shared `Library.xml` is found, so the column
@@ -376,7 +461,7 @@ export interface Backend {
    * Imports the ticked iTunes playlists — `itunes:<index>` ids from an
    * {@link ItunesLibrary} tree — into the library, folders above them kept.
    */
-  importItunesSelected(path: string, ids: readonly string[]): Promise<XmlImportReport>;
+  importItunesSelected(path: string, ids: readonly string[], confirmReplace: ConfirmReplace): Promise<XmlImportReport | null>;
   /**
    * Writes the collection as rekordbox's XML where the platform's save
    * dialog says; resolves to how many tracks, or null when cancelled.
@@ -384,29 +469,31 @@ export interface Backend {
   exportXml(): Promise<number | null>;
 
   /**
-   * Writes a playlist to `destination`, asking for one when none is given.
+   * Writes a playlist (or a folder's playlists) to the stick mounted at
+   * `destination`, one of `listDevices`'s paths. rekordbox exports to a
+   * connected device and never asks for a folder, and neither does this
+   * (#142).
    *
-   * Resolves to what was written, or `null` if the picker was cancelled. A
-   * destination that already holds one of our exports is synced rather than
-   * rewritten.
+   * Resolves to what was written. A destination that already holds one of
+   * our exports is synced rather than rewritten.
    */
   exportPlaylist(
     playlistId: string,
-    destination?: string,
+    destination: string,
     /** What a stick with no settings of its own is given; see `StickDefaults`. */
     defaults?: StickDefaults,
     /** Remove RBXport-exported music outside the playlists being synced. */
     deleteUnlistedMusic?: boolean,
     /** Convert incompatible USB copies; undefined preserves the source format. */
-    compatibilityFormat?: "wav" | "mp3",
-  ): Promise<ExportReport | null>;
+    compatibilityFormat?: "wav" | "aiff" | "mp3",
+  ): Promise<ExportReport>;
 
   /**
    * Export Track: puts tracks on a stick on their own, in no playlist,
    * beside what the stick already holds. A later sync keeps them unless
    * deleteUnlistedMusic is enabled.
    */
-  exportTracksToDevice(tracks: string[], destination: string, defaults?: StickDefaults, compatibilityFormat?: "wav" | "mp3"): Promise<ExportReport>;
+  exportTracksToDevice(tracks: string[], destination: string, defaults?: StickDefaults, compatibilityFormat?: "wav" | "aiff" | "mp3"): Promise<ExportReport>;
 
   /**
    * rekordbox's reference browse categories and sort options: what a
@@ -451,9 +538,16 @@ export interface Backend {
   /** Called after each track of an export, while one runs. Returns its own unsubscribe. */
   onExportProgress(listener: (progress: ExportProgress) => void): () => void;
   exportProgress(): Promise<ExportProgress[]>;
+  /** Called per track while an XML collection is being imported (done of total). */
+  onImportProgress(listener: (progress: ExportProgress) => void): () => void;
   cancelExport(path: string): Promise<void>;
-  /** A yes-or-no question in the platform's own dialog; false when dismissed. */
-  confirm(message: string, labels?: { yes: string; no: string }): Promise<boolean>;
+  /**
+   * A yes-or-no question in the platform's own dialog; false when dismissed.
+   * `title` heads the dialog where rekordbox gives its own a title.
+   */
+  confirm(message: string, labels?: { yes: string; no: string; title?: string }): Promise<boolean>;
+  /** A message in the platform's own dialog, with one OK button. */
+  tell(message: string, title: string): Promise<void>;
   /** The volumes an export could be written to, and what is on each. */
   listDevices(): Promise<Device[]>;
   /**
@@ -496,7 +590,7 @@ export interface Backend {
    * interface (the first one when none is given) and serves the library to
    * every player that asks. Refused, with the reason, while rekordbox runs.
    */
-  startLinkExport(iface?: string, keyDisplay?: KeyDisplay, keySort?: "alphabetical" | "musical"): Promise<LinkStatus>;
+  startLinkExport(iface?: string, settings?: LinkDeviceSettings, keySort?: "alphabetical" | "musical"): Promise<LinkStatus>;
   stopLinkExport(): Promise<LinkStatus>;
   /** Tells a CDJ on the link to load a specific track from our library. */
   loadTrackOnLink(playerNumber: number, trackId: string): Promise<void>;
@@ -529,6 +623,8 @@ export interface Backend {
   deckPlayAfter(deck: DeckId, delayMs: number): Promise<void>;
   deckPause(deck: DeckId): Promise<void>;
   deckSeek(deck: DeckId, positionMs: number): Promise<void>;
+  /** Moves the playhead by `byMs` from where the engine has it now. */
+  deckMove(deck: DeckId, byMs: number): Promise<void>;
   /**
    * Sets a loop between two points and turns it on. A head already past
    * the out point goes back to the in point. The deck rounds at the out
@@ -601,6 +697,11 @@ export interface Backend {
   deckMasterTempo(deck: DeckId, on: boolean): Promise<void>;
   /** A click on every beat of the deck's grid while it plays. */
   deckMetronome(deck: DeckId, on: boolean): Promise<void>;
+  /**
+   * The grid the deck's metronome clicks on, as milliseconds and whether
+   * each beat is a downbeat. Nothing is saved.
+   */
+  setMetronomeGrid(deck: DeckId, beats: [number, boolean][]): Promise<void>;
   /** The key, in semitones from the track's own; −12 to 12. */
   deckKeyShift(deck: DeckId, semitones: number): Promise<void>;
   /** Preferences › Audio › Metronome: which click (1 to 3) and how loud. */
@@ -628,6 +729,15 @@ export interface Backend {
   setEqCurve(isolator: boolean): Promise<void>;
   /** Both decks now, to anchor the interface when it starts. */
   deckState(): Promise<Tick>;
+  /**
+   * The browser's preview player: a click on a row's waveform plays the track
+   * from there without loading it onto a deck, and pauses the decks, as
+   * rekordbox does outside PERFORMANCE mode. Its own player, so it has no
+   * tick: the interface asks `previewState` while it plays.
+   */
+  previewPlay(trackId: string, positionMs: number): Promise<void>;
+  previewStop(): Promise<void>;
+  previewState(): Promise<PreviewState>;
   /** Both decks, ten times a second, and only while something is playing. */
   onDeckTick(listener: (tick: Tick) => void): () => void;
   /**
@@ -653,24 +763,57 @@ export interface Backend {
   /** Shows a track's file in the Finder. */
   revealTrack(trackId: string): Promise<void>;
 
-  missingTracks(limit: number): Promise<MissingTracks>;
+  /**
+   * A page of the Missing File Manager's list, `limit` tracks from `offset`.
+   * `rescan` checks every track's file again; otherwise the page comes from
+   * the last check.
+   */
+  missingTracks(offset: number, limit: number, rescan: boolean): Promise<MissingTracks>;
+  /**
+   * The Missing File Manager's Delete: the missing tracks named, or every
+   * missing track when `tracks` is null, leave the collection and every
+   * playlist. Resolves to how many went.
+   */
+  removeMissingTracks(tracks: string[] | null): Promise<number>;
+  /**
+   * Collection tracks that have never been analysed and whose file is there,
+   * a page of at most `limit` (1 to 128) scanned from row `from`. Ask again
+   * from `next` until it is null.
+   */
+  unanalysedTracks(from: number, limit: number): Promise<UnanalysedTracks>;
   /** Tracks that share a title and an artist, the first `limit` groups listed. */
   findDuplicates(limit: number): Promise<Duplicates>;
 
   /**
-   * Asks the user for a file and points a track at it.
-   *
-   * Resolves to the chosen path, or `null` if they cancelled. Outside Tauri
-   * there is no picker, so it resolves to `null` immediately.
+   * Relocate's file chooser for one track, under `title`, showing only
+   * files of `fileName`'s extension, opened in `folder` when given.
+   * Resolves to the chosen path, or `null` if they cancelled.
    */
-  relocateTrack(trackId: string): Promise<string | null>;
+  chooseRelocateFile(title: string, fileName: string, folder: string | null): Promise<string | null>;
+  /**
+   * Points a track at `path`. Resolves to false, writing nothing, when the
+   * collection already holds that file.
+   */
+  relocateTrack(trackId: string, path: string): Promise<boolean>;
+  /**
+   * The named tracks whose file is missing, in the order named; at most 128
+   * are looked at per call.
+   */
+  relocationTargets(tracks: string[]): Promise<MissingTrack[]>;
+  /**
+   * Relocate's "find other missing file using the location of this track":
+   * each named missing track found where it would be had it moved from
+   * `from` to `to` is pointed there. Resolves to how many were found.
+   */
+  relocateByLocation(tracks: string[], from: string, to: string): Promise<number>;
 
   /**
-   * Points every missing track at a file of the same name found under one
-   * of `folders`, searched in order. A track whose name is found nowhere
-   * is left missing.
+   * Points missing tracks at a file of the same name found under the search
+   * folders, in rekordbox's order: the tracks named, or every missing track
+   * when `tracks` is null. A track whose name is found nowhere is left
+   * missing.
    */
-  autoRelocate(folders: string[]): Promise<RelocateReport>;
+  autoRelocate(search: RelocateSearch, tracks: string[] | null): Promise<RelocateReport>;
 
   /** Opens a folder picker; null when it is cancelled. */
   pickFolder(title: string): Promise<string | null>;
@@ -725,7 +868,7 @@ export interface Backend {
     /** Remove RBXport-exported music outside the playlists being synced. */
     deleteUnlistedMusic?: boolean,
     /** Convert incompatible USB copies; undefined preserves the source format. */
-    compatibilityFormat?: "wav" | "mp3",
+    compatibilityFormat?: "wav" | "aiff" | "mp3",
   ): Promise<SyncDeviceReport[]>;
 
   /** Missing source audio in the exact playlists selected for USB export. */
@@ -736,7 +879,12 @@ export interface Backend {
 
   /** What a stick was last synced with, and what it holds now. */
   deviceSyncState(path: string): Promise<DeviceSyncState>;
-  importUsb(path: string, cues: boolean, history: boolean, settings: boolean): Promise<{ tracks: number; histories: number; settings: number; skipped: number; warnings?: string[] }>;
+  /**
+   * Brings cues and grids, play history and CDJ/mixer settings back from a
+   * stick. `unchanged` counts tracks whose cues and grid on the stick already
+   * match the library; they are not rewritten.
+   */
+  importUsb(path: string, cues: boolean, history: boolean, settings: boolean): Promise<{ tracks: number; histories: number; settings: number; skipped: number; unchanged?: number; warnings?: string[] }>;
 
   /**
    * An intelligent playlist's rule, for the editor; an empty "all" for a
@@ -793,6 +941,18 @@ export interface Backend {
   explorerChildren(path: string): Promise<ExplorerChildren>;
 
   /**
+   * The libraries on a stick, Device Library first, each with its playlist
+   * tree. A stick with neither answers with none.
+   */
+  deviceLibraries(path: string): Promise<DeviceLibrary[]>;
+  /**
+   * Changes one library's playlists on a stick, as rekordbox's Devices tree
+   * does: that library only, never the other. Resolves to the playlist or
+   * folder the edit was about (the new one for a create).
+   */
+  devicePlaylistEdit(path: string, format: DeviceFormat, edit: DevicePlaylistEdit): Promise<DevicePlaylistEditResult>;
+
+  /**
    * One track's full record: what the information panel's Summary and Info
    * tabs show and the row DTO does not carry.
    *
@@ -801,12 +961,28 @@ export interface Backend {
    */
   trackDetails(trackId: string): Promise<TrackDetails>;
 
+  /**
+   * Several tracks for the information panel's multiple selection: the
+   * first one's record and which fields differ. `trackIds` in the order the
+   * list reports the selection.
+   */
+  selectionDetails(trackIds: readonly string[]): Promise<SelectionDetails>;
+
   /** What the Info tab's Key and Genre dropdowns offer: what the library holds. */
   trackLookups(): Promise<TrackLookups>;
 }
 
 /** Which deck. Two, named rather than indexed, as the mixer is. */
 export type DeckId = "a" | "b";
+
+/** The browser's preview player. */
+export interface PreviewState {
+  /** The track it holds, or null before anything was previewed. */
+  track: string | null;
+  playing: boolean;
+  positionMs: number;
+  durationMs: number;
+}
 
 /** Something an AppleScript asks of the window; see `src/lib/scripting.ts`. */
 export interface ScriptRequest {
@@ -858,6 +1034,11 @@ export interface UpdateCheck {
   changes: UpdateChange[];
   /** Set when the version on offer is already downloaded this run. */
   ready: UpdateReady | null;
+  /**
+   * This copy was installed by the Microsoft Store, which installs its
+   * updates. The check did not ask the download server; `version` is null.
+   */
+  storeInstall: boolean;
 }
 
 /** A downloaded update, and whether it is already in the app's place. */
@@ -1013,6 +1194,47 @@ export interface Device {
   volumeId: string;
   /** What is already on it, null when it holds no export. */
   export: DeviceExport | null;
+}
+
+/** One of the two libraries a stick can hold: `export.pdb` or `exportLibrary.db`. */
+export type DeviceFormat = "deviceLibrary" | "oneLibrary";
+
+/** A library on a stick, for the Devices tree. */
+export interface DeviceLibrary {
+  format: DeviceFormat;
+  /** Tracks in the library, for All Tracks. */
+  tracks: number;
+  /** Playlists and folders in tree order. */
+  nodes: DeviceLibraryNode[];
+}
+
+export interface DeviceLibraryNode {
+  id: string;
+  /** `"0"` for the top level. */
+  parentId: string;
+  name: string;
+  folder: boolean;
+  /** Under the Playlists heading: 0 for the top level. */
+  depth: number;
+  /** Tracks in a playlist; children of a folder. */
+  count: number;
+}
+
+/**
+ * An edit to a stick's playlists. `parent` `"0"` is the Playlists heading.
+ * Tracks are the rows' own ids, as a device view lists them.
+ */
+export type DevicePlaylistEdit =
+  | { kind: "create"; parent: string; name: string; folder: boolean }
+  | { kind: "rename"; id: string; name: string }
+  | { kind: "delete"; id: string }
+  | { kind: "add"; playlist: string; tracks: string[] }
+  | { kind: "remove"; playlist: string; tracks: string[] };
+
+export interface DevicePlaylistEditResult {
+  id: string;
+  /** What changed; 0 when there was nothing to do. */
+  changed: number;
 }
 
 /** What a device already holds. */
@@ -1227,6 +1449,8 @@ export interface AnalysisSettings {
   highPrecision: boolean;
   minBpm: number;
   maxBpm: number;
+  /** Add a memory cue on the new grid's first beat unless one is there. */
+  firstBeatCue: boolean;
 }
 
 /** What analysing one track found, now written to the library. */
@@ -1253,6 +1477,28 @@ export interface ImportReport {
   skipped: string[];
   /** The tracks that landed, so they can be queued for analysis. */
   tracks: { id: string; title: string }[];
+  /** Files that were already in the library, with their existing track ids. */
+  existing: { id: string; title: string }[];
+}
+
+/** What dropping one folder onto the playlist tree did. */
+export interface FolderPlaylistReport {
+  /** The folder's name, which is the playlist's. */
+  name: string;
+  /** The playlist made, or null when nothing was written. */
+  playlist: string | null;
+  /** A same-named sibling awaiting the user's answer; nothing was written. */
+  conflict: string | null;
+  /** False for a loose file: rekordbox ignores those on a folder drop. */
+  folder: boolean;
+  imported: number;
+  skipped: string[];
+  /** The tracks that landed, so they can be queued for analysis. */
+  tracks: { id: string; title: string }[];
+  /** How many of the folder's files the library already held. */
+  existing: number;
+  /** The drop's insert index under the target, for its next folder. */
+  at: number | null;
 }
 
 /** What importing a rekordbox XML collection did. */
@@ -1274,6 +1520,30 @@ export interface XmlImportReport {
   playlists: number;
   cues: number;
   tracks: { id: string; title: string }[];
+  /**
+   * Folders and playlists already in the library under the same parent with
+   * the same name, which the import would replace. When not empty nothing
+   * was imported: the backend waits to be asked again with `replace`.
+   */
+  sameNamed?: string[];
+}
+
+/**
+ * Asked before an import replaces folders or playlists already in the
+ * library (their names given); true to replace them.
+ */
+export type ConfirmReplace = (names: readonly string[]) => Promise<boolean>;
+
+/**
+ * Preferences › Advanced › Database › Auto Relocate Search Folders: the
+ * user's folders (empty unless Specified user folders is ticked), then the
+ * Music, Movies/Videos and Desktop folders where ticked.
+ */
+export interface RelocateSearch {
+  folders: string[];
+  music: boolean;
+  video: boolean;
+  desktop: boolean;
 }
 
 /** What an automatic relocate did. */
@@ -1288,6 +1558,7 @@ export interface MissingTrack {
   id: string;
   title: string;
   artist: string;
+  album: string;
   /** Where the library still expects it. */
   path: string;
 }
@@ -1314,8 +1585,15 @@ export interface Duplicates {
   shown: DuplicateGroup[];
 }
 
+/** One page of the tracks Auto Analysis would analyse. */
+export interface UnanalysedTracks {
+  tracks: { id: string; title: string }[];
+  /** The row the next page starts from; null once the library is done. */
+  next: number | null;
+}
+
 export interface MissingTracks {
-  /** Every missing track, not just the ones listed. */
+  /** Every missing track, not just the ones in this page. */
   total: number;
   tracks: MissingTrack[];
 }
@@ -1384,23 +1662,33 @@ export interface Edits {
   /** Remove from Collection: the tracks leave the library and every playlist. The files stay. */
   removeFromCollection(tracks: string[]): Promise<number>;
   reorderPlaylist(playlist: string, tracks: string[]): Promise<number>;
-  setTrackRating(track: string, stars: number): Promise<EditHistoryState>;
-  setTrackComment(track: string, comment: string): Promise<EditHistoryState>;
-  setTrackColor(track: string, color: string | null): Promise<EditHistoryState>;
+  /**
+   * The edits below take every track they apply to — one from the list, or
+   * the information panel's whole selection — and record them as one step
+   * of history.
+   */
+  setTrackRating(tracks: readonly string[], stars: number): Promise<EditHistoryState>;
+  setTrackComment(tracks: readonly string[], comment: string): Promise<EditHistoryState>;
+  setTrackColor(tracks: readonly string[], color: string | null): Promise<EditHistoryState>;
   /**
    * One of the Info tab's editable fields, by wire name. The backend keeps
    * the list of what may be written; a name it does not know is refused as
-   * `readOnly` rather than mapped onto a guess.
+   * `readOnly` rather than mapped onto a guess. The title is refused for
+   * more than one track because rekordbox greys its Track Title box for a
+   * multiple selection. The BPM is refused for more than one track as well,
+   * but not on rekordbox evidence: a BPM write retimes one track's beat grid,
+   * and the panel's BPM box is locked anyway, so the refusal only guards
+   * other callers.
    */
-  setTrackField(track: string, field: TrackField, value: string): Promise<EditHistoryState>;
+  setTrackField(tracks: readonly string[], field: TrackField, value: string): Promise<EditHistoryState>;
   /** Sets the My Tags on a track to exactly these ids. */
   setMyTags(track: string, tags: string[]): Promise<EditHistoryState>;
   /** Add Artwork: the image is filed in the share tree and the track points at it. */
-  addArtwork(track: string, image: string): Promise<EditHistoryState>;
+  addArtwork(tracks: readonly string[], image: string): Promise<EditHistoryState>;
   /** Add Artwork on a playlist or folder, from the tree menu. */
   addPlaylistArtwork(playlist: string, image: string): Promise<number>;
   /** Delete Artwork: the track points at no image; the file stays. */
-  clearArtwork(track: string): Promise<EditHistoryState>;
+  clearArtwork(tracks: readonly string[]): Promise<EditHistoryState>;
 
   /**
    * Cues. Unlike the edits above these do not return a generation: a cue
@@ -1555,6 +1843,25 @@ export interface TrackDetails {
   myTags: string[];
 }
 
+/**
+ * Several selected tracks, as the information panel shows them.
+ *
+ * rekordbox reads each field from the first selected track and leaves a
+ * field the tracks do not all share blank (7.2.11,
+ * `TrackInfoConcreteMediator::getTrackProp`).
+ */
+export interface SelectionDetails {
+  /** The first selected track that is still in the library. */
+  first: TrackDetails;
+  /** How many of the selected tracks are still in the library. */
+  count: number;
+  /**
+   * The `TrackDetails` fields that differ between the tracks, plus
+   * `"artwork"` when they do not all show the same image.
+   */
+  mixed: (keyof TrackDetails | "artwork")[];
+}
+
 export interface TrackLookups {
   keys: string[];
   genres: string[];
@@ -1638,6 +1945,14 @@ export type WaveformPosition = "center" | "left";
 export type OverviewWaveform = "half" | "full";
 export type KeyDisplay = "classic" | "alphanumeric";
 
+/** DJ System display settings advertised to players over LINK. */
+export interface LinkDeviceSettings {
+  waveformColor: WaveformColor;
+  waveformPosition: WaveformPosition;
+  overviewWaveform: OverviewWaveform;
+  keyDisplay: KeyDisplay;
+}
+
 /** The reference rows a fresh stick's `exportLibrary.db` starts from. */
 export interface ReferenceStickSettings {
   categories: MenuSlot[];
@@ -1674,8 +1989,10 @@ export interface DeviceSettings {
   /** The library rows were read; when false they are the reference rows and are not written. */
   hasLibrarySettings: boolean;
   deviceName: string;
-  /** `property.backGroundColorType`, carried but not understood. */
+  /** Background Color : OneLibrary — `property.backGroundColorType`, 0 Default, 1 Pink … 8 Purple. */
   backgroundColorType: number;
+  /** Background Color : Device Library — `export.pdb`'s `property` row, same values; null without one. */
+  deviceLibraryBackgroundColorType: number | null;
   categories: MenuSlot[];
   sorts: MenuSlot[];
   /** `menuItem` of the sort option shown beside the track name, or null for Not Specified. */

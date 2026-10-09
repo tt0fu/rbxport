@@ -11,6 +11,7 @@
 //! Nothing here touches the user's library: it reads from an already-loaded
 //! index and writes only under the destination directory.
 
+pub mod device_library;
 pub mod ext_pdb;
 pub mod manifest;
 pub mod sync_record;
@@ -194,6 +195,10 @@ pub struct ExportReport {
     pub reused: usize,
     /// What not copying them saved.
     pub bytes_reused: u64,
+    /// Of `reused`, tracks whose library file already lives on the stick
+    /// itself: the databases point at it where it is and nothing is copied,
+    /// as rekordbox does.
+    pub in_place: usize,
     /// Tracks taken off the stick because the selection no longer holds them.
     pub removed: usize,
     /// Playlists newly present in this generation (folders excluded).
@@ -389,16 +394,99 @@ pub(crate) fn path_key(path: &str) -> String {
     path.nfc().collect::<String>().to_lowercase()
 }
 
-fn layouts(tracks: &[SourceTrack], ids: &[u32], root: &str, previous: Option<&Manifest>) -> Vec<Layout> {
-    let mut used = BTreeSet::new();
-    tracks.iter().zip(ids).map(|(track, id)| {
+/// Where a track's audio already sits on the stick, when the library keeps the
+/// file there: the stick-relative path the databases can name as it is.
+///
+/// rekordbox does not copy such a file. `DatabaseMediator::
+/// get_device_file_path_candidate` (7.2.19 arm64 @0x1009ba39c) keeps the
+/// on-device path when the track's path starts with the device root and
+/// `hasSpecialCharInFilePath` (@0x1009baeb8) finds no component a stick cannot
+/// carry; `export_track_data` (@0x1009b8ca4) then copies the file onto itself,
+/// which `juce::File::copyFileTo` treats as done [OBS static]. A path with
+/// such a component is copied under `Contents/` like any other, as there.
+fn on_stick(destination: &Path, source: &Path) -> Option<String> {
+    use unicode_normalization::UnicodeNormalization;
+    let root = destination.canonicalize().ok()?;
+    let file = source.canonicalize().ok().filter(|f| f.is_file())?;
+    let relative = file.strip_prefix(&root).ok()?;
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else { return None };
+        let name = name.to_str()?;
+        // `fat_safe` changes nothing but the characters a stick cannot carry
+        // (and the normal form, which a lookup on the stick ignores).
+        if fat_safe(name) != name.nfc().collect::<String>() { return None; }
+        parts.push(name);
+    }
+    // Never adopt our own staging area or the rekordbox folders as music.
+    let first = parts.first()?;
+    if ["PIONEER", ".PIONEER", PUBLICATION].iter().any(|r| first.eq_ignore_ascii_case(r)) { return None; }
+    Some(format!("/{}", parts.join("/")))
+}
+
+/// Whether a previous export's entry names the library's own file, where the
+/// library keeps it on the stick, rather than a copy the export made. Such a
+/// file is never the export's to delete, replace, or rename.
+///
+/// The `in_place` flag says so for entries this version wrote. An entry from
+/// an older version has no flag, yet its library file may sit exactly where
+/// the export would have copied it (`Contents/<Artist>/<Album>/<file>`), and
+/// that export then copied it onto itself: a library track whose source is the
+/// very file its audio path names is the library's too.
+fn owns_library_file(destination: &Path, entry: &ManifestTrack) -> bool {
+    entry.in_place
+        || (entry.library_id != 0 && same_file(Path::new(&entry.source), &under(destination, &entry.audio)))
+}
+
+/// The audio paths, by [`path_key`], of every library file a previous export
+/// left in place (see [`owns_library_file`]).
+fn previous_in_place(destination: &Path, previous: Option<&Manifest>) -> BTreeSet<String> {
+    previous.into_iter().flat_map(|m| &m.tracks)
+        .filter(|t| owns_library_file(destination, t))
+        .map(|t| path_key(&t.audio))
+        .collect()
+}
+
+/// [`on_stick`] for each track the selection names; `None` for a track that
+/// is copied. Only one track can own a file: a second library entry for the
+/// same file is copied beside it rather than sharing its analysis.
+///
+/// A device track kept only because the stick still lists it (its history or
+/// a playlist made on the player) stays in place too when it is a library
+/// file an earlier export left there: it keeps its path, nothing copies over
+/// it, and the record keeps saying the file is not the export's.
+fn in_place_paths(destination: &Path, tracks: &[SourceTrack], previous: &BTreeSet<String>) -> Vec<Option<String>> {
+    let mut claimed = BTreeSet::new();
+    tracks.iter().map(|track| {
+        if let Some(device) = track.device.as_ref().filter(|d| d.preserve) {
+            return (previous.contains(&path_key(&device.audio))
+                && same_file(&track.source_path, &under(destination, &device.audio))
+                && claimed.insert(path_key(&device.audio)))
+                .then(|| device.audio.clone());
+        }
+        on_stick(destination, &track.source_path).filter(|path| claimed.insert(path_key(path)))
+    }).collect()
+}
+
+fn layouts(tracks: &[SourceTrack], ids: &[u32], root: &str, previous: Option<&Manifest>, in_place: &[Option<String>], previous_in_place: &BTreeSet<String>) -> Vec<Layout> {
+    // Library files on the stick keep their names, and nothing copied may land
+    // on one: not this run's, nor one an earlier run pointed at and left.
+    let mut used: BTreeSet<String> = in_place.iter().flatten().map(|path| path_key(path))
+        .chain(previous_in_place.iter().cloned())
+        .collect();
+    tracks.iter().zip(ids).zip(in_place).map(|((track, id), in_place)| {
         let mut place = layout(track, *id);
         if let Some(device) = track.device.as_ref().filter(|d| d.preserve) {
             place.audio.clone_from(&device.audio);
             place.file_name = Path::new(&place.audio).file_name().unwrap_or_default().to_string_lossy().into_owned();
             place.anlz_dir.clone_from(&device.analysis_dir);
+        } else if let Some(audio) = in_place {
+            place.audio.clone_from(audio);
+            audio.rsplit('/').next().unwrap_or_default().clone_into(&mut place.file_name);
         }
         place.anlz_dir = place.anlz_dir.replacen("/PIONEER/", &format!("/{root}/"), 1);
+        // A file left in place is where the library keeps it: never renamed.
+        if in_place.is_some() { return place; }
         // Keep a previous collision suffix when another colliding track goes away.
         if let Some(old) = previous.and_then(|m| m.tracks.iter().find(|t| t.key() == track_key(track.id, &track.source_path.to_string_lossy()))) {
             if old.conversion.is_empty() && Path::new(&old.audio).parent() == Path::new(&place.audio).parent() && old.source == track.source_path.to_string_lossy() {
@@ -612,10 +700,14 @@ pub fn export_full(
 
 #[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
-pub enum CompatibilityFormat { Wav, Mp3 }
+pub enum CompatibilityFormat { Wav, Aiff, Mp3 }
 impl CompatibilityFormat {
     fn audio(self) -> rbl_audio::compatibility::Format {
-        match self { Self::Wav => rbl_audio::compatibility::Format::Wav, Self::Mp3 => rbl_audio::compatibility::Format::Mp3 }
+        match self {
+            Self::Wav => rbl_audio::compatibility::Format::Wav,
+            Self::Aiff => rbl_audio::compatibility::Format::Aiff,
+            Self::Mp3 => rbl_audio::compatibility::Format::Mp3,
+        }
     }
 }
 
@@ -667,6 +759,7 @@ pub fn export_cancellable(
     rbl_core::durable::create_dir_all(&anlz_root)?;
     rbl_core::durable::create_dir_all(&db_dir)?;
 
+    recover(destination)?;
     let publication = rbl_core::durable::Publication::new(destination, PUBLICATION)?;
     let mut previous = Manifest::load(destination);
     let before = snapshot::Snapshot::read(destination)?;
@@ -725,7 +818,9 @@ pub fn export_cancellable(
         keys: &mut keys,
     };
 
-    let layouts = layouts(tracks, &ids, root_name, previous.as_ref());
+    let previous_in_place = previous_in_place(destination, previous.as_ref());
+    let in_place_paths = in_place_paths(destination, tracks, &previous_in_place);
+    let layouts = layouts(tracks, &ids, root_name, previous.as_ref(), &in_place_paths, &previous_in_place);
     // Losing access to a selected source must never delete its good USB copy.
     for track in tracks {
         if !track.source_path.is_file() && previous.as_ref().is_some_and(|m| m.tracks.iter().any(|t| t.key() == track_key(track.id, &track.source_path.to_string_lossy()))) {
@@ -795,13 +890,16 @@ pub fn export_cancellable(
         if !written_audio_paths.insert(path_key(&place.audio)) {
             return Err(ExportError::Conflict(format!("Conversion would create duplicate audio path: {}", place.audio)));
         }
+        // Still the library's own file on the stick, not renamed for a
+        // conversion or an analysis collision: point at it, copy nothing.
+        let in_place = in_place_paths.get(index).and_then(Option::as_deref) == Some(place.audio.as_str());
         let profile = conversion.map_or("", rbl_audio::compatibility::Format::profile);
         let source_hash = if conversion.is_some() { file_hash(&track.source_path)? } else { 0 };
         let carried = stale.remove(&key);
         let audio_dest = under(destination, &place.audio);
         // Unchanged means: same source bytes by size and time, same place on
         // the stick, and still actually there.
-        let unchanged_metadata = carried.is_some_and(|c| {
+        let unchanged_metadata = !in_place && carried.is_some_and(|c| {
             c.audio == place.audio && c.size == size && c.modified == modified && c.conversion == profile
         });
         // The previous export recorded the bytes it actually placed on the
@@ -832,7 +930,12 @@ pub fn export_cancellable(
         } else { false };
 
         let output_size;
-        if unchanged {
+        if in_place {
+            output_size = size;
+            report.reused += 1;
+            report.in_place += 1;
+            report.bytes_reused += size;
+        } else if unchanged {
             output_size = std::fs::metadata(&audio_dest)?.len();
             report.reused += 1;
             report.bytes_reused += output_size;
@@ -840,7 +943,7 @@ pub fn export_cancellable(
             progress(&ExportProgress { stage: "copying", done: index, total: tracks.len(), title: track.title.clone() });
             let audio_dest = under(publication.stage(), &place.audio);
             if let Some(parent) = audio_dest.parent() {
-                std::fs::create_dir_all(parent)?;
+                std::fs::create_dir_all(parent).map_err(context(format!("Could not create the folder for '{}'", track.title)))?;
             }
             let written = match conversion {
                 Some(target) => rbl_audio::compatibility::convert(&track.source_path, &audio_dest, target)
@@ -853,14 +956,15 @@ pub fn export_cancellable(
                     return Err(ExportError::Conflict(format!("Source disappeared while copying '{}': {e}", track.title)));
                 }
                 Err(e) if is_device_gone(&e) => return Err(ExportError::DeviceGone),
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(context(format!("Could not copy '{}' to the USB", track.title))(e).into()),
             }
         }
 
         // Renaming an artist moves the file; the copy under the old name would
         // otherwise sit on the stick forever, unreferenced.
         if let Some(c) = carried {
-            if c.audio != place.audio && !same_file(&under(destination, &c.audio), &audio_dest) {
+            // A file that was the library's own is never ours to delete.
+            if c.audio != place.audio && !owns_library_file(destination, c) && !same_file(&under(destination, &c.audio), &audio_dest) {
                 obsolete.push((c.audio.clone(), false));
             }
             if c.anlz_dir != place.anlz_dir {
@@ -919,9 +1023,10 @@ pub fn export_cancellable(
         }
         if !track.analysis.is_empty() && !analysis_current {
             let anlz_dir = under(publication.stage(), &place.anlz_dir);
-            std::fs::create_dir_all(&anlz_dir)?;
+            let failed = context(format!("Could not write the analysis of '{}'", track.title));
+            std::fs::create_dir_all(&anlz_dir).map_err(&failed)?;
             for (extension, bytes) in analysis {
-                std::fs::write(anlz_dir.join(format!("ANLZ0000.{extension}")), bytes)?;
+                std::fs::write(anlz_dir.join(format!("ANLZ0000.{extension}")), bytes).map_err(&failed)?;
                 report.analysis_files += 1;
             }
         }
@@ -944,7 +1049,11 @@ pub fn export_cancellable(
             None => 0,
         };
 
-        let audio_hash = if unchanged {
+        // An adopted file is not read: on a stick of music that would be
+        // every byte of it, every sync, to protect nothing we wrote.
+        let audio_hash = if in_place {
+            0
+        } else if unchanged {
             existing_audio_hash.map_or_else(|| file_hash(&audio_dest), Ok)?
         } else {
             file_hash(&under(publication.stage(), &place.audio))?
@@ -968,6 +1077,7 @@ pub fn export_cancellable(
             conversion: profile.to_owned(),
             conversion_source_hash: source_hash,
             audio_hash,
+            in_place,
         });
 
         // The same facts the pdb row carries, kept for exportLibrary.db.
@@ -1048,7 +1158,8 @@ pub fn export_cancellable(
 
     // Whatever the previous export left that this one does not name.
     for entry in stale.values() {
-        obsolete.push((entry.audio.clone(), false));
+        // A file that was the library's own is never ours to delete.
+        if !owns_library_file(destination, entry) { obsolete.push((entry.audio.clone(), false)); }
         obsolete.push((entry.anlz_dir.clone(), true));
         report.removed += 1;
     }
@@ -1092,27 +1203,65 @@ pub fn export_cancellable(
         artwork.entries().map(|(id, _)| (id, artwork_path(id, "a", false).replacen("/PIONEER/", &format!("/{root_name}/"), 1))).collect();
     let artwork_rows: Vec<Vec<u8>> = artwork_paths.iter().map(|(id, path)| artwork_row(*id, path)).collect();
 
+    // A DeviceSQL row has to fit on one page. Without this check the page
+    // builder cuts the row off and the stick's export.pdb is corrupt, which
+    // verification reports only as the two databases disagreeing.
+    let limit = rbl_pdb::build::max_row_len(PAGE_SIZE);
+    if let Some((row, track)) = track_rows.iter().zip(&one_library_tracks).find(|(row, _)| row.len() > limit) {
+        return Err(ExportError::Conflict(format!(
+            "'{}' has more text in its title, comment and other tags than export.pdb can hold for one track ({} bytes; at most {limit}). Shorten them and sync again; the USB was left as it was.",
+            track.title,
+            row.len()
+        )));
+    }
+    let genre_rows: Vec<_> = genres.entries().map(|(id, n)| simple_named_row(id, n)).collect();
+    let artist_rows: Vec<_> = artists.entries().map(|(id, n)| artist_row(id, n)).collect();
+    let album_rows: Vec<_> = albums.entries().map(|(id, n)| album_row(id, 0, n)).collect();
+    let label_rows: Vec<_> = labels.entries().map(|(id, n)| simple_named_row(id, n)).collect();
+    let key_rows: Vec<_> = keys.entries().map(|(id, n)| key_row(id, n)).collect();
+    for (kind, names, rows) in [
+        ("genre", &genres, &genre_rows), ("artist", &artists, &artist_rows), ("album", &albums, &album_rows),
+        ("label", &labels, &label_rows), ("key", &keys, &key_rows),
+    ] {
+        if let Some(((_, name), row)) = names.entries().zip(rows).find(|(_, row)| row.len() > limit) {
+            let start: String = name.chars().take(40).collect();
+            return Err(ExportError::Conflict(format!(
+                "The {kind} '{start}…' is longer than export.pdb can hold ({} bytes; at most {limit}). Shorten it and sync again; the USB was left as it was.",
+                row.len()
+            )));
+        }
+    }
+    if let Some((row, playlist)) = playlist_rows.iter().zip(playlists).find(|(row, _)| row.len() > limit) {
+        let start: String = playlist.name.chars().take(40).collect();
+        return Err(ExportError::Conflict(format!(
+            "The playlist name '{start}…' is longer than export.pdb can hold ({} bytes; at most {limit}). Shorten it and sync again; the USB was left as it was.",
+            row.len()
+        )));
+    }
+
     progress(&ExportProgress { stage: "database", done: tracks.len(), total: tracks.len(), title: String::new() });
     let pdb = build_pdb(&PdbTables {
         tracks: &track_rows,
-        genres: &genres.entries().map(|(id, n)| simple_named_row(id, n)).collect::<Vec<_>>(),
-        artists: &artists.entries().map(|(id, n)| artist_row(id, n)).collect::<Vec<_>>(),
-        albums: &albums.entries().map(|(id, n)| album_row(id, 0, n)).collect::<Vec<_>>(),
-        labels: &labels.entries().map(|(id, n)| simple_named_row(id, n)).collect::<Vec<_>>(),
-        keys: &keys.entries().map(|(id, n)| key_row(id, n)).collect::<Vec<_>>(),
+        genres: &genre_rows,
+        artists: &artist_rows,
+        albums: &album_rows,
+        labels: &label_rows,
+        keys: &key_rows,
         playlists: &playlist_rows,
         entries: &entry_rows,
         artwork: &artwork_rows,
         history: &before.history,
         colors: settings.as_ref().or(defaults).map_or(&[], |s| &s.colors),
+        device_name: settings.as_ref().or(defaults).map_or("", |s| s.device_name.as_str()),
+        background: before.legacy_background,
     });
     report.pdb_bytes = pdb.len();
     let staged_db = publication.stage().join(root_name).join("rekordbox");
-    std::fs::create_dir_all(&staged_db)?;
-    std::fs::write(staged_db.join("export.pdb"), &pdb)?;
+    std::fs::create_dir_all(&staged_db).map_err(context("Could not write export.pdb".to_owned()))?;
+    std::fs::write(staged_db.join("export.pdb"), &pdb).map_err(context("Could not write export.pdb".to_owned()))?;
     // The tags, for the player's My Tag browsing.
     let master_db_id = my_tag_master_db_id(sync);
-    std::fs::write(staged_db.join("exportExt.pdb"), ext_pdb::build(my_tags, master_db_id))?;
+    std::fs::write(staged_db.join("exportExt.pdb"), ext_pdb::build(my_tags, master_db_id)).map_err(context("Could not write exportExt.pdb".to_owned()))?;
 
     write_one_library(&staged_db, &one_library_tracks, playlists, &playlist_ids, &export_ids, &artwork_paths, my_tags, settings.as_ref().or(defaults), master_db_id, &before, Some(&existing_database))?;
     report.one_library = true;
@@ -1134,7 +1283,7 @@ pub fn export_cancellable(
         let kept = sync_record::read(destination).map(|r| r.timestamps).unwrap_or_default();
         let device_ids = playlists.iter().zip(&playlist_ids).map(|(p, id)| (p.id, *id)).collect();
         let bytes = sync_record::render_with_ids(sync, &ticked, rbl_core::time::unix_millis(), &kept, &device_ids);
-        for file in sync_record::FILES { std::fs::write(publication.stage().join(file.replacen("PIONEER/", &format!("{root_name}/"), 1)), &bytes)?; }
+        for file in sync_record::FILES { std::fs::write(publication.stage().join(file.replacen("PIONEER/", &format!("{root_name}/"), 1)), &bytes).map_err(context(format!("Could not write {file}")))?; }
     }
 
     // Last, so a run that fails part way leaves the older record standing and
@@ -1149,13 +1298,16 @@ pub fn export_cancellable(
         .map(|(_, track)| track.id)
         .collect();
     let retained: BTreeSet<String> = recorded.iter().flat_map(|track| [track.audio.to_lowercase(), track.anlz_dir.to_lowercase()]).collect();
+    // The audio paths as both databases name them, which is what the staged
+    // copies are published under.
+    let named: Vec<String> = recorded.iter().map(|track| track.audio.clone()).collect();
     let after = snapshot::Snapshot::read_at(publication.stage(), root_name)?;
     before.check_retained_history(&after)?;
     before.check_changes(previous.as_ref(), &after)?;
     progress(&ExportProgress { stage: "verifying", done: tracks.len(), total: tracks.len(), title: String::new() });
     let verified = verification::verify_staged(publication.stage(), destination, &after)?;
     if !verified.is_ok() {
-        return Err(ExportError::Conflict(format!("Staged export did not verify: {:?}; {}", verified.missing_audio, verified.errors.join("; "))));
+        return Err(ExportError::Conflict(format!("The export did not verify, so the USB was left as it was: {}", verification_failure(&verified))));
     }
     Manifest {
         db_id,
@@ -1170,8 +1322,10 @@ pub fn export_cancellable(
             .collect(),
         loose,
     }
-    .save_at(publication.stage(), root_name)?;
-    let mut files = staged_files(publication.stage())?;
+    .save_at(publication.stage(), root_name)
+    .map_err(context("Could not write the rbxport manifest".to_owned()))?;
+    let named: Vec<&str> = named.iter().map(String::as_str).collect();
+    let mut files = staged_files(publication.stage(), &named)?;
     // A rebuilt database never inherits WAL pages from its previous image.
     files.splice(0..0, [format!("{root_name}/rekordbox/exportLibrary.db-wal").into(), format!("{root_name}/rekordbox/exportLibrary.db-shm").into()]);
     files.extend(deletions);
@@ -1204,14 +1358,19 @@ struct PdbTables<'a> {
     artwork: &'a [Vec<u8>],
     history: &'a [snapshot::History],
     colors: &'a [rbl_onelibrary::settings::ColorName],
+    /// `property.deviceName` in `exportLibrary.db`; the PDB carries a copy.
+    device_name: &'a str,
+    /// "Background Color : Device Library", carried from the stick.
+    background: u8,
 }
 
 /// Builds `export.pdb` with the twenty tables rekordbox writes, in its
 /// order: the eight the library fills, the eight colours, the artwork
 /// (type 13) among six that are always empty (types 9 to 15), the browse column
 /// names and the History menu's two tables (`rbl_pdb::reference`), and the
-/// one `history` row that carries the export's date [OBS 7.2.11]. A player
-/// looks the table list up by type, so the empty ones have to be there.
+/// one `property` row: device name, track count, the export's date and the
+/// Device Library background colour [OBS 7.2.14]. A player looks the table
+/// list up by type, so the empty ones have to be there.
 fn build_pdb(tables: &PdbTables<'_>) -> Vec<u8> {
     use rbl_pdb::reference;
     let mut file = FileBuilder::new(PAGE_SIZE);
@@ -1258,9 +1417,14 @@ fn build_pdb(tables: &PdbTables<'_>) -> Vec<u8> {
     file.add_table(17, &constant(reference::HISTORY_PLAYLISTS));
     file.add_table(18, &constant(reference::HISTORY_ENTRIES));
     // The local day, as rekordbox dates the export where the machine is.
-    let today = rbl_core::time::local_date();
-    let history = reference::history_row(&today).map_or_else(Vec::new, |row| vec![row]);
-    file.add_table(19, &history);
+    let property = rbl_pdb::rows::PdbProperty {
+        device_name: tables.device_name.to_owned(),
+        contents: u32::try_from(tables.tracks.len()).unwrap_or(u32::MAX),
+        created_date: rbl_core::time::local_date(),
+        background_color: tables.background,
+        ..rbl_pdb::rows::PdbProperty::default()
+    };
+    file.add_table(19, &rbl_pdb::rows::property_row(&property).map_or_else(Vec::new, |row| vec![row]));
     file.finish()
 }
 
@@ -1290,6 +1454,7 @@ pub fn create_library_with_root(
     if destination.exists() && !destination.is_dir() {
         return Err(ExportError::NotADirectory(destination.to_owned()));
     }
+    recover(destination)?;
     let publication = rbl_core::durable::Publication::new(destination, PUBLICATION)?;
     let root_name = export_root_name_with(destination, preferred_root)?;
     let db_dir = destination.join(root_name).join("rekordbox");
@@ -1322,6 +1487,8 @@ pub fn create_library_with_root(
         artwork: &[],
         history: &[],
         colors: defaults.map_or(&[], |s| &s.colors),
+        device_name: defaults.map_or("", |s| s.device_name.as_str()),
+        background: 0,
     });
     rbl_core::durable::write(&db_dir.join("export.pdb"), &pdb)?;
     // The library's tags go on even a stick with no tracks [OBS 7.2.11:
@@ -1329,7 +1496,7 @@ pub fn create_library_with_root(
     let master_db_id = my_tag_master_db_id(sync);
     rbl_core::durable::write(&db_dir.join("exportExt.pdb"), &ext_pdb::build(my_tags, master_db_id))?;
     write_one_library(&db_dir, &[], &[], &[], &[], &[], my_tags, defaults, master_db_id, &snapshot::Snapshot::default(), None)?;
-    let files = staged_files(publication.stage())?;
+    let files = staged_files(publication.stage(), &[])?;
     publication.commit(&files)?;
     Ok(true)
 }
@@ -1531,7 +1698,7 @@ fn write_one_library(
     }
     let created = rbl_core::time::local_date();
     builder.finish(&settings.device_name, &created, master_db_id).map_err(|e| one_library_error(&e))?;
-    rbl_core::durable::replace(&staged, &path)?;
+    rbl_core::durable::replace(&staged, &path).map_err(|e| ExportError::OneLibrary(e.to_string()))?;
     Ok(())
 }
 
@@ -1689,6 +1856,13 @@ pub fn copy_my_settings(destination: &Path, source: &Path) -> Result<usize> {
     Ok(written)
 }
 
+/// An I/O error that says what was being done when it happened, keeping its
+/// kind; the bare OS text ("No such file or directory") names nothing a
+/// user can act on.
+fn context(what: String) -> impl Fn(std::io::Error) -> std::io::Error {
+    move |error| std::io::Error::new(error.kind(), format!("{what}: {error}"))
+}
+
 /// Errors that mean the media was unplugged mid-write.
 fn is_device_gone(e: &std::io::Error) -> bool {
     matches!(
@@ -1712,25 +1886,99 @@ pub fn verify_databases(destination: &Path) -> Result<VerifyReport> {
     verification::verify_databases(destination)
 }
 
+/// What a failed verification found, as one clause: the problems, then
+/// the audio it could not find, without an empty list when there is none.
+#[must_use]
+pub fn verification_failure(report: &VerifyReport) -> String {
+    let mut problems = report.errors.clone();
+    if !report.parsed && problems.is_empty() {
+        problems.push("the databases could not be read back".to_owned());
+    }
+    if !report.missing_audio.is_empty() {
+        const SHOWN: usize = 3;
+        let missing = report.missing_audio.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+        let more = report.missing_audio.len().saturating_sub(SHOWN);
+        problems.push(if more > 0 { format!("audio missing: {missing} and {more} more") } else { format!("audio missing: {missing}") });
+    }
+    problems.join("; ")
+}
+
 const PUBLICATION: &str = ".rbxport-publication";
 
 /// Complete an interrupted export before reading or changing the device.
+///
+/// An export that stopped part way leaves its journal on the device, and
+/// this finishes it. When the device was written to since, which rekordbox
+/// does by itself the moment it sees the stick, the journal cannot be
+/// finished without overwriting those writes, and refusing left the stick
+/// unusable until it was reformatted (#229). Instead the interrupted export
+/// is settled around those writes, finished or rolled back depending on
+/// which generation the other writer saw (see
+/// `rbl_core::durable::Publication::set_aside`), and its journal is set aside
+/// under `rbxport/recovered-<ms>/` in the library root, so the next export
+/// starts from the device as it is now.
 pub fn recover(destination: &Path) -> std::io::Result<()> {
-    rbl_core::durable::Publication::recover(destination, PUBLICATION)
+    match rbl_core::durable::Publication::recover(destination, PUBLICATION) {
+        Err(error) if rbl_core::durable::is_device_changed(&error) => {
+            let root_name = export_root_name(destination).unwrap_or("PIONEER");
+            let keep = destination.join(root_name).join(format!("rbxport/recovered-{}", rbl_core::time::unix_millis()));
+            if let Some(theirs) = rbl_core::durable::Publication::set_aside(destination, PUBLICATION, &keep)? {
+                tracing::warn!(
+                    device = %destination.display(),
+                    kept = %keep.display(),
+                    changed_by_another_writer = ?theirs,
+                    %error,
+                    "settled an interrupted export the device had changed since, keeping the other writer's files; the next export starts from the device as it is"
+                );
+            }
+            Ok(())
+        }
+        other => other,
+    }
 }
 
-fn staged_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+/// The files staged under `root`, relative to it, under the names they are
+/// to be published as.
+///
+/// The directory listing is not that name on a stick mounted by macOS:
+/// its FAT32 and exFAT drivers list every name in NFD while the export
+/// writes NFC (`fat_safe`), and a FAT32 stick then refuses to rename the
+/// file by its listed name [OBS 2026-10-08; see `rbl_core::durable`]. So a
+/// listed path is published as the one of `named` it matches in NFC, which
+/// is how the databases name it, and in NFC when it matches none.
+fn staged_files(root: &Path, named: &[&str]) -> std::io::Result<Vec<PathBuf>> {
     fn walk(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
-            if entry.file_type()?.is_dir() { walk(root, &entry.path(), files)?; }
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                // An AppleDouble companion can go with its file meanwhile.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            if file_type.is_dir() { walk(root, &entry.path(), files)?; }
             else { files.push(entry.path().strip_prefix(root).map_err(std::io::Error::other)?.to_owned()); }
         }
         Ok(())
     }
+    let named: BTreeMap<PathBuf, PathBuf> = named
+        .iter()
+        .map(|path| {
+            let path = PathBuf::from(path.trim_start_matches('/'));
+            (rbl_core::durable::nfc_path(&path), path)
+        })
+        .collect();
     let mut files = Vec::new();
     walk(root, root, &mut files)?;
+    let mut files: Vec<PathBuf> = files
+        .into_iter()
+        .map(|listed| {
+            let nfc = rbl_core::durable::nfc_path(&listed);
+            named.get(&nfc).cloned().unwrap_or(nfc)
+        })
+        .collect();
     files.sort();
+    files.dedup();
     Ok(files)
 }
 
@@ -1776,6 +2024,33 @@ mod tests {
             .is_some_and(|extension| extension.eq_ignore_ascii_case("aiff")));
         assert_eq!(fat_file_name("Omega - The Hidden Beauty Of Dutch House '94-'98 - 04 Le Rève.aiff"),
             "Omega - The Hidden Beauty Of Dutch House '94-'98 - 04 Le Rève.aiff");
+    }
+
+    /// macOS lists a FAT32 or exFAT stick's names in NFD whatever form they
+    /// were written in, and a FAT32 stick will not rename a file by that
+    /// name: publishing from the listing failed at 99% with "No such file or
+    /// directory" (#122, #161). The listing has to come back as the names
+    /// the databases use. A temporary directory keeps the form a name is
+    /// given in, so an NFD file here lists the way the stick does.
+    #[test]
+    fn staged_files_are_published_under_the_names_the_databases_use() {
+        let stage = tempfile::tempdir().unwrap();
+        let listed_nfd = stage.path().join("Contents/Bjo\u{308}rk/Album/Kesa\u{308}.mp3");
+        std::fs::create_dir_all(listed_nfd.parent().unwrap()).unwrap();
+        std::fs::write(&listed_nfd, b"audio").unwrap();
+        let other = stage.path().join("Contents/Bjo\u{308}rk/Album/Ebano\u{301}.mp3");
+        std::fs::write(&other, b"audio").unwrap();
+        std::fs::create_dir_all(stage.path().join("PIONEER/rekordbox")).unwrap();
+        std::fs::write(stage.path().join("PIONEER/rekordbox/export.pdb"), b"pdb").unwrap();
+
+        // One named by the databases (in NFC, as `fat_safe` writes names),
+        // one not named at all.
+        let files = staged_files(stage.path(), &["/Contents/Bj\u{f6}rk/Album/Kes\u{e4}.mp3"]).unwrap();
+        assert_eq!(files, vec![
+            PathBuf::from("Contents/Bj\u{f6}rk/Album/Eban\u{f3}.mp3"),
+            PathBuf::from("Contents/Bj\u{f6}rk/Album/Kes\u{e4}.mp3"),
+            PathBuf::from("PIONEER/rekordbox/export.pdb"),
+        ]);
     }
 
     #[test]

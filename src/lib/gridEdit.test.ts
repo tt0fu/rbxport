@@ -1,8 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { applyEditFrom, tapTempo, tapTimeout, withTap, roundEven, validateEdit, type EditableBeat } from "./gridEdit";
+import { applyEditFrom, nudgeGrid, tapTempo, tapTimeout, withTap, roundEven, validateEdit, type EditableBeat } from "./gridEdit";
 const grid = (): EditableBeat[] => Array.from({length: 9}, (_, i) => ({timeMs: i * 500, number: i % 4 + 1, tempoX100: 12000}));
 const times = (beats: EditableBeat[]) => beats.map(b => b.timeMs);
 describe("Ghidra-derived beat-grid vectors", () => {
+  it("nudges a deck's grid as the saved edit will", () => {
+    const beats = grid();
+    const deck = { times: Uint32Array.from(times(beats)), numbers: Uint8Array.from(beats, b => b.number), tempos: Uint16Array.from(beats, b => b.tempoX100) };
+    const saved = applyEditFrom(beats, null, {kind: "nudge", ms: 7}, 4500);
+    const out = nudgeGrid(deck, 7, 4500);
+    expect(Array.from(out.times)).toEqual(times(saved));
+    expect(Array.from(out.numbers)).toEqual(saved.map(b => b.number));
+  });
   it("keeps time zero and extends to the supplied duration", () => {
     expect(times(applyEditFrom(grid(), null, {kind: "nudge", ms: -1}, 4500))).toEqual([499,999,1499,1999,2499,2999,3499,3999,4499]);
   });
@@ -10,6 +18,21 @@ describe("Ghidra-derived beat-grid vectors", () => {
     const out = applyEditFrom(grid(), null, {kind: "downbeat", timeMs: 1600}, 4000);
     expect(out.find(b => b.timeMs === 1600)?.number).toBe(1);
     expect(times(out)).toEqual([100,600,1100,1600,2100,2600,3100,3600]);
+  });
+  it("saves the presses of a held stretch as one stretch with the same grid (#196)", () => {
+    // A grid over the whole track, as analysis leaves it: 120 BPM for 200 s.
+    const track = Array.from({length: 400}, (_, i) => ({timeMs: i * 500, number: i % 4 + 1, tempoX100: 12000}));
+    for (const [fromMs, steps] of [[null, [1, 10, 10, 10, 10, 10]], [null, [-1, -10, -10, -10, -10]], [8000, [1, 10, 10, -10, 10]]] as const) {
+      const oneByOne = steps.reduce((beats, byMs) => applyEditFrom(beats, fromMs, {kind: "stretch", byMs, timeMs: 32_000}, 200_000), track);
+      const batched = applyEditFrom(track, fromMs, {kind: "stretch", byMs: steps.reduce((a: number, b) => a + b, 0), timeMs: 32_000}, 200_000);
+      expect(batched.length).toBe(oneByOne.length);
+      expect(batched.map(b => b.tempoX100)).toEqual(oneByOne.map(b => b.tempoX100));
+      // Every beat the stretch placed lands where the presses one by one put
+      // it; the few beats the narrower grid frees at the end are extended at
+      // the whole-millisecond interval, from a different last beat, so they
+      // may be a millisecond apart.
+      batched.forEach((beat, i) => expect(Math.abs(beat.timeMs - oneByOne[i]!.timeMs)).toBeLessThanOrEqual(i < track.length ? 0 : 1));
+    }
   });
   it("uses target distance for stretch, including ties-to-even rounding", () => {
     const out = applyEditFrom(grid(), null, {kind: "stretch", byMs: 1, timeMs: 1000}, 4000);

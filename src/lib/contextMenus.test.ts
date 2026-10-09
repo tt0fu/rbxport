@@ -1,8 +1,30 @@
 import { describe, expect, it } from "vitest";
 
-import { deckMenu, enabled, entriesOf, SEPARATOR, shortcutMenu, TRACK_MENU, trackMenuFor, treeMenu, type MenuContext } from "./contextMenus";
+import {
+  deckMenu, deleteKeyAction, deviceTrackMenu, deviceTreeMenu, enabled, entriesOf, MISSING_TRACK_MENU, MISSING_TRACK_TITLE,
+  SEPARATOR, shortcutMenu, TRACK_MENU, trackMenuFor, treeMenu, type MenuContext, type MenuRow,
+} from "./contextMenus";
 
 const OPEN: MenuContext = { inPlaylist: true, hasFile: true, readOnly: false };
+
+describe("MISSING_TRACK_MENU", () => {
+  it("is rekordbox's menu over a missing track, under its heading", () => {
+    // [OBS rekordbox 7.2.14, Winrig chris-win11 2026-10-08, issue #201]
+    expect(MISSING_TRACK_TITLE).toBe("File is Missing");
+    expect(MISSING_TRACK_MENU.map((row) => (row === SEPARATOR ? row : row.label))).toEqual([
+      "Auto Relocate",
+      "Relocate",
+      "Remove from Collection",
+    ]);
+  });
+
+  it("writes, so a read-only library greys all three", () => {
+    for (const entry of entriesOf(MISSING_TRACK_MENU)) {
+      expect(enabled(entry, OPEN), entry.label).toBe(true);
+      expect(enabled(entry, { ...OPEN, readOnly: true }), entry.label).toBe(false);
+    }
+  });
+});
 
 describe("TRACK_MENU", () => {
   it("is rekordbox's own list, in its own order, less the cloud", () => {
@@ -152,6 +174,29 @@ describe("treeMenu", () => {
     expect(tagged).not.toContain("Remove from Playlist");
   });
 
+  it("lists the connected sticks under Export Playlist and Export Folder, with no folder picker", () => {
+    // #142: Export Playlist opened a folder picker. rekordbox's submenu is
+    // the connected drives, one row each [OBS rekordbox 7, Winrig 2026-10-08].
+    const sticks = [{ id: "E:\\", name: "USB" }, { id: "/Volumes/DJ STICK", name: "DJ STICK" }];
+    for (const [kind, label] of [["playlist", "Export Playlist"], ["smartPlaylist", "Export Playlist"], ["folder", "Export Folder"]] as const) {
+      const row = entriesOf(treeMenu(kind, sticks)).find((e) => e.label === label);
+      expect(row?.submenu).toBe(true);
+      expect(row?.action).toBeNull();
+      expect(row?.items && entriesOf(row.items).map((e) => [e.label, e.action])).toEqual([
+        ["USB", "exportTo:E:\\"],
+        ["DJ STICK", "exportTo:/Volumes/DJ STICK"],
+      ]);
+      expect(enabled(row ?? { label, action: null }, OPEN)).toBe(true);
+      // An export writes the stick, not the library: it stays live while
+      // rekordbox holds the library.
+      expect(enabled(row ?? { label, action: null }, { ...OPEN, readOnly: true })).toBe(true);
+    }
+    // With nothing connected the arrow is there and greyed, not a picker.
+    const bare = entriesOf(treeMenu("playlist")).find((e) => e.label === "Export Playlist");
+    expect(bare?.items).toBeUndefined();
+    expect(enabled(bare ?? { label: "", action: null }, OPEN)).toBe(false);
+  });
+
   it("a folder's menu is rekordbox's own: no artwork or file export, and Sort Items", () => {
     expect(entriesOf(treeMenu("folder")).map((e) => e.label)).toEqual([
       "Export Folder",
@@ -224,6 +269,69 @@ describe("enabled", () => {
   });
 });
 
+describe("the Explorer's track menu, against rekordbox's", () => {
+  // rekordbox 7, right-clicking a file in the Explorer [OBS Winrig
+  // 2026-10-08, issue #105]: a file the collection does not hold
+  // (Music/RBX-ARTWORK-TEST, rekordbox-06-menu-not-imported.png) and one it
+  // does (the sampler's 4-Floor Breaks Kit, rekordbox-17-menu-imported.png).
+  // Live entries only; every other row was drawn greyed. Cloud Library Sync
+  // is left out here on purpose, and Show in Explorer is Show in Finder.
+  const REKORDBOX_LIVE = {
+    loose: [
+      "Import To Collection", "Add To Playlist", "Add To Tag List", "Reload Tag", "Get Info from iTunes",
+      "Export Track", "Auto Load Hot Cue", "Reset DJ Play Count", "Show information", "Show in Finder",
+      "Track information",
+    ],
+    imported: [
+      "Analyze Track", "Analysis Lock", "Add To Playlist", "Add To Tag List", "Reload Tag",
+      "Get Info from iTunes", "Export Track", "Auto Load Hot Cue", "Reset DJ Play Count",
+      "Remove from Collection", "Show information", "Show in Finder", "Track information",
+    ],
+  };
+  // Where this still differs, and why. In every view: rows this does not do
+  // (iTunes, Auto Load, KUVO) and Load, which rekordbox greyed in its Export
+  // layout. Over a loose file only: entries rekordbox leaves live whose effect
+  // on a file outside the collection has not been observed [UNKNOWN].
+  const EVERY_VIEW = ["Load", "Get Info from iTunes", "Auto Load Hot Cue", "Track information"];
+  const LOOSE_UNOBSERVED = ["Add To Tag List", "Reload Tag", "Export Track", "Reset DJ Play Count", "Show information"];
+
+  const rows = trackMenuFor(2, [{ id: "p1", name: "Warm Up" }], [{ id: "/Volumes/USB", name: "USB" }], { explorer: true });
+  const explorer: MenuContext = { inPlaylist: false, inHistory: false, hasFile: true, readOnly: false };
+  const live = (loose: boolean) =>
+    entriesOf(rows).filter((e) => enabled(e, { ...explorer, loose })).map((e) => e.label);
+
+  it("draws rekordbox's rows, with no Convert Memory Cues to Hot Cues", () => {
+    expect(entriesOf(rows).map((e) => e.label)).toEqual([
+      "Load", "Import To Collection", "Analyze Track", "Analysis Lock", "Add To Playlist", "Add To Tag List",
+      "Reload Tag", "Get Info from iTunes", "Track Type", "Export Track", "Auto Load Hot Cue",
+      "Reset DJ Play Count", "Add New Analysis Data", "Remove from Playlist", "Remove from Collection",
+      "Remove from History", "Show information", "Show in Finder", "Track information",
+    ]);
+    expect(rows.filter((row) => row === SEPARATOR)).toHaveLength(7);
+    // The rest of the browser keeps it, as rekordbox's Collection does.
+    expect(entriesOf(trackMenuFor(2)).map((e) => e.label)).toContain("Convert Memory Cues to Hot Cues");
+  });
+
+  it("over an imported file, is a track's menu: the one rekordbox draws", () => {
+    const differs = new Set(EVERY_VIEW);
+    expect(live(false).filter((l) => !differs.has(l))).toEqual(
+      REKORDBOX_LIVE.imported.filter((l) => !differs.has(l)),
+    );
+  });
+
+  it("over a file the library does not hold, imports it and adds it to a playlist", () => {
+    const differs = new Set([...EVERY_VIEW, ...LOOSE_UNOBSERVED]);
+    expect(live(true).filter((l) => !differs.has(l))).toEqual(
+      REKORDBOX_LIVE.loose.filter((l) => !differs.has(l)),
+    );
+    // Pinned so closing a gap is a deliberate edit here.
+    expect(live(true).filter((l) => differs.has(l))).toEqual(["Load"]);
+    const add = entriesOf(rows).find((e) => e.label === "Add To Playlist");
+    expect(entriesOf(add?.items ?? []).every((e) => enabled(e, { ...explorer, loose: true }))).toBe(true);
+    expect(enabled(add ?? { label: "", action: null }, { ...explorer, loose: true, readOnly: true })).toBe(false);
+  });
+});
+
 describe("deckMenu", () => {
   const state = { waveformColor: "3band" as const, beatCount: "position" as const, waveformClick: true };
 
@@ -254,5 +362,57 @@ describe("deckMenu", () => {
   it("offers Analyze Track for the loaded track", () => {
     const entry = entriesOf(deckMenu(state)).find((e) => e.label === "Analyze Track");
     expect(entry?.action).toBe("analyse");
+  });
+});
+
+describe("deleteKeyAction", () => {
+  it("is the removal the list's own menu offers, as rekordbox's Delete key is (#136)", () => {
+    expect(deleteKeyAction("collection")).toBe("removeFromCollection");
+    expect(deleteKeyAction("playlist")).toBe("removeFromPlaylist");
+    expect(deleteKeyAction("history")).toBe("removeFromHistory");
+    expect(deleteKeyAction("tagList")).toBe("removeFromTagList");
+  });
+
+  it("does nothing where there is nothing to remove from", () => {
+    for (const source of ["folder", "playlistFolder", "related"]) {
+      expect(deleteKeyAction(source)).toBeNull();
+    }
+  });
+});
+
+describe("a stick's own library", () => {
+  const live = <A extends string>(rows: readonly MenuRow<A>[], context: MenuContext = { inPlaylist: false, hasFile: false, readOnly: false }) =>
+    entriesOf(rows).filter((e) => enabled(e, context)).map((e) => e.label);
+
+  it("draws rekordbox 7.2.14's tree menus [OBS Winrig 2026-10-08], with the edits this app makes live", () => {
+    expect(entriesOf(deviceTreeMenu("devicePlaylists")).map((e) => e.label)).toEqual([
+      "Create New Playlist", "Create New Folder", "Import Folder", "Delete All", "Sort Items", "Add To Shortcut",
+    ]);
+    expect(live(deviceTreeMenu("devicePlaylists"))).toEqual(["Create New Playlist", "Create New Folder"]);
+    expect(entriesOf(deviceTreeMenu("devicePlaylist")).map((e) => e.label)).toEqual([
+      "Add Artwork", "Import Playlist", "Delete Playlist", "Export a playlist to a file", "Add To Shortcut",
+    ]);
+    expect(live(deviceTreeMenu("devicePlaylist"))).toEqual(["Delete Playlist"]);
+    expect(live(deviceTreeMenu("deviceFolder"))).toEqual(["Create New Playlist", "Create New Folder", "Delete Folder"]);
+  });
+
+  it("greys every edit to a stick while rekordbox holds it or the stick is busy", () => {
+    const busy = { inPlaylist: false, hasFile: false, readOnly: true };
+    for (const kind of ["devicePlaylists", "deviceFolder", "devicePlaylist"] as const) {
+      expect(live(deviceTreeMenu(kind), busy)).toEqual([]);
+    }
+    expect(live(deviceTrackMenu([{ id: "3", name: "Top List" }], true), { inPlaylist: true, hasFile: true, readOnly: true })).toEqual([]);
+  });
+
+  it("offers a library's playlists to its tracks, and Remove from Playlist only inside one", () => {
+    const inAll = deviceTrackMenu([{ id: "3", name: "Top List" }], false);
+    expect(entriesOf(inAll).map((e) => e.label)).toEqual([
+      "Add To Playlist", "Delete Track", "Retrieve the waveform from collection", "Update Collection", "Show information",
+    ]);
+    const add = entriesOf(inAll)[0];
+    expect(add?.items && entriesOf(add.items).map((e) => [e.label, e.action])).toEqual([["Top List", "deviceAddToPlaylist:3"]]);
+    const open = { inPlaylist: true, hasFile: true, readOnly: false };
+    expect(entriesOf(deviceTrackMenu([], true)).filter((e) => enabled(e, open)).map((e) => e.label)).toEqual(["Remove from Playlist"]);
+    expect(entriesOf(deviceTrackMenu([], false)).some((e) => e.label === "Remove from Playlist")).toBe(false);
   });
 });

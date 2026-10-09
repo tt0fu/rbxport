@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  browseListVars,
   browseScale,
   BROWSE_SCALE_DEFAULT,
   DEFAULT_PREFERENCES,
@@ -47,6 +48,13 @@ describe("sanitisePreferences", () => {
     expect(sanitisePreferences({ analysis: { auto: "yes" } }).analysis.auto).toBe(false);
     expect(sanitisePreferences({ analysis: { auto: true } }).analysis.auto).toBe(true);
   });
+
+  it("leaves the first-beat memory cue off unless it is explicitly enabled", () => {
+    expect(DEFAULT_PREFERENCES.analysis.firstBeatCue).toBe(false);
+    expect(sanitisePreferences({ analysis: { firstBeatCue: "yes" } }).analysis.firstBeatCue).toBe(false);
+    expect(sanitisePreferences({ analysis: { firstBeatCue: true } }).analysis.firstBeatCue).toBe(true);
+  });
+
   it("keeps the browser key-sort choice and preserves the old display-based ordering", () => {
     expect(sanitisePreferences({view: {keySort: "musical"}}).view.keySort).toBe("musical");
     expect(sanitisePreferences({view: {keySort: "invalid"}}).view.keySort).toBe("alphabetical");
@@ -99,6 +107,20 @@ describe("sanitisePreferences", () => {
     expect(out.advanced.syncType).toBe("bpm");
     expect(out.advanced.quantizeBeat).toBe("1/1");
     expect(out.advanced.protectLibrary).toBe(true);
+  });
+
+  it("searches Music, Video and Desktop by default, as rekordbox does", () => {
+    // [OBS rekordbox 7.2.19 static] defaults 1, 1, 1 and 0 at 0x1037bbacc.
+    const fresh = sanitisePreferences({ advanced: {} }).advanced;
+    expect([fresh.relocateMusic, fresh.relocateVideo, fresh.relocateDesktop, fresh.relocateUserFolders])
+      .toEqual([true, true, true, false]);
+    const kept = sanitisePreferences({
+      advanced: { relocateMusic: false, relocateVideo: false, relocateDesktop: false, relocateUserFolders: true },
+    }).advanced;
+    expect([kept.relocateMusic, kept.relocateVideo, kept.relocateDesktop, kept.relocateUserFolders])
+      .toEqual([false, false, false, true]);
+    // Folders saved before the box existed stay searched.
+    expect(sanitisePreferences({ advanced: { relocateFolders: ["/a"] } }).advanced.relocateUserFolders).toBe(true);
   });
 
   it("checks for updates unless the store plainly says not to", () => {
@@ -161,12 +183,32 @@ it("requires an explicit boolean to enable USB music cleanup", () => {
   expect(sanitisePreferences({ usbExport: { deleteUnlistedMusic: "true" } }).usbExport.deleteUnlistedMusic).toBe(false);
 });
 
-it("defaults compatibility conversion to off and WAV, and preserves MP3 selection", () => {
+it("defaults compatibility conversion to off and WAV, and preserves AIFF and MP3 selections", () => {
   const defaults = sanitisePreferences({}).usbExport;
   expect(defaults.maximumCompatibility).toBe(false);
   expect(defaults.conversionFormat).toBe("wav");
   expect(sanitisePreferences({ usbExport: { maximumCompatibility: true, conversionFormat: "mp3" } }).usbExport)
     .toMatchObject({ maximumCompatibility: true, conversionFormat: "mp3" });
+  expect(sanitisePreferences({ usbExport: { maximumCompatibility: true, conversionFormat: "aiff" } }).usbExport)
+    .toMatchObject({ maximumCompatibility: true, conversionFormat: "aiff" });
   expect(sanitisePreferences({ usbExport: { maximumCompatibility: "yes", conversionFormat: "flac" } }).usbExport)
     .toMatchObject({ maximumCompatibility: false, conversionFormat: "wav", importButtonCues: true, importButtonHistory: true, importButtonSettings: false });
+});
+
+describe("browseListVars", () => {
+  it("scales row height and font size from the Browse sliders", () => {
+    const v = { browseFontSize: 4, browseLineSpace: 0, browseBold: true };
+    const vars = browseListVars(v, 25);
+    expect(vars["--s-row-height"]).toBe("20px");
+    expect(vars["--f-size-ui"]).toBe("calc(1.3 * var(--f-size-ui-base))");
+    expect(vars["--browse-weight"]).toBe(700);
+  });
+  it("is the measured size at the default stops", () => {
+    const vars = browseListVars(
+      { browseFontSize: BROWSE_SCALE_DEFAULT, browseLineSpace: BROWSE_SCALE_DEFAULT, browseBold: false },
+      25,
+    );
+    expect(vars["--s-row-height"]).toBe("25px");
+    expect(vars["--browse-weight"]).toBe(400);
+  });
 });

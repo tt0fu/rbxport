@@ -42,6 +42,12 @@ export interface Playback {
    */
   playAfter: (delayMs: number) => void;
   seek: (seconds: number) => void;
+  /**
+   * Moves the head by `seconds` from where the engine has it. A seek worked
+   * out from the drawn head lands late by the time the command takes; this
+   * does not, so many small moves do not add up to an error.
+   */
+  moveBy: (seconds: number) => void;
   /** Seek by fraction, for clicking the waveform. */
   seekFraction: (fraction: number) => void;
   /** The deck's loop, as the engine reports it; null for none. */
@@ -62,7 +68,16 @@ export interface Playback {
    */
   scrubBegin: () => void;
   scrubTo: (seconds: number) => void;
-  scrubEnd: () => void;
+  /**
+   * Ends a drag. `snap` can move the landing place: a synced deck lands in
+   * phase with the master. It gets where the drag let go, in seconds.
+   */
+  scrubEnd: (snap?: (seconds: number) => number) => void;
+  /**
+   * Whether a drag holds the head, or its landing is not yet in the ticks.
+   * The phase lock waits for this, so it does not fight the hand.
+   */
+  isScrubbing: () => boolean;
   /**
    * How fast the deck is playing, as a multiple of the file's own speed.
    *
@@ -647,6 +662,24 @@ export function usePlayback(trackId: string | null, DECK: DeckId = DEFAULT_DECK,
     [idle, emit, isLoaded, DECK, setPosition],
   );
 
+  const moveBy = useCallback(
+    (seconds: number) => {
+      if (idle || !Number.isFinite(seconds) || !isLoaded()) return;
+      anchor.current = {
+        ...anchor.current,
+        frames: anchor.current.frames + seconds * anchor.current.sampleRate,
+      };
+      void (async () => {
+        try {
+          await (await getBackend()).deckMove(DECK, seconds * 1000);
+        } catch (failure) {
+          setError(reasonFrom(failure));
+        }
+      })();
+    },
+    [idle, isLoaded, DECK],
+  );
+
   /**
    * Audio follows the pointer while a waveform is dragged.
    *
@@ -789,7 +822,7 @@ export function usePlayback(trackId: string | null, DECK: DeckId = DEFAULT_DECK,
     [idle, isLoaded, DECK],
   );
 
-  const scrubEnd = useCallback(() => {
+  const scrubEnd = useCallback((snap?: (seconds: number) => number) => {
     if (!scrubbing.current) return;
     scrubbing.current = false;
     // Still pinned: the seek is a command behind the ticks, so the next one or
@@ -804,8 +837,18 @@ export function usePlayback(trackId: string | null, DECK: DeckId = DEFAULT_DECK,
       cancelAnimationFrame(flushing.current);
       flushing.current = 0;
     }
-    const target = pending.current;
+    let target = pending.current;
     pending.current = null;
+    if (snap) {
+      const at = target ?? positionRef.current;
+      const snapped = snap(at);
+      if (Number.isFinite(snapped) && Math.abs(snapped - at) > 0.001) {
+        target = Math.max(snapped, -5);
+        anchor.current = pinned(anchor.current, target, performance.now());
+        setPosition(target);
+        emit(target);
+      }
+    }
     void (async () => {
       try {
         const backend = await getBackend();
@@ -815,7 +858,7 @@ export function usePlayback(trackId: string | null, DECK: DeckId = DEFAULT_DECK,
         setError(reasonFrom(failure));
       }
     })();
-  }, [DECK]);
+  }, [DECK, emit, setPosition]);
 
   // A drag that is still pending when the player goes away must not fire.
   useEffect(
@@ -832,6 +875,8 @@ export function usePlayback(trackId: string | null, DECK: DeckId = DEFAULT_DECK,
     },
     [duration, seek],
   );
+
+  const isScrubbing = useCallback(() => scrubbing.current || landing.current !== null, []);
 
   const positionNow = useCallback(
     () => (anchor.current.playing ? extrapolate(anchor.current, performance.now()) : positionRef.current),
@@ -877,11 +922,11 @@ export function usePlayback(trackId: string | null, DECK: DeckId = DEFAULT_DECK,
   }, [loopCall, DECK]);
 
   return useMemo(() => ({
-    playing, position, duration, idle, error, toggle, playAfter, seek, seekFraction,
-    scrubBegin, scrubTo, scrubEnd, positionRef, positionNow, subscribe,
+    playing, position, duration, idle, error, toggle, playAfter, seek, moveBy, seekFraction,
+    scrubBegin, scrubTo, scrubEnd, isScrubbing, positionRef, positionNow, subscribe,
     tempo, masterTempo, keyShift, shiftsKey, setKeyShift, setTempo, nudgeTempo, setMasterTempo,
     loop, setLoop, setLoopActive, clearLoop,
-  }), [playing, position, duration, idle, error, toggle, playAfter, seek, seekFraction,
-    scrubBegin, scrubTo, scrubEnd, positionNow, subscribe, tempo, masterTempo, keyShift, shiftsKey,
+  }), [playing, position, duration, idle, error, toggle, playAfter, seek, moveBy, seekFraction,
+    scrubBegin, scrubTo, scrubEnd, isScrubbing, positionNow, subscribe, tempo, masterTempo, keyShift, shiftsKey,
     setKeyShift, setTempo, nudgeTempo, setMasterTempo, loop, setLoop, setLoopActive, clearLoop]);
 }

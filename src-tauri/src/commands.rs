@@ -15,7 +15,7 @@ use tauri_plugin_opener::OpenerExt;
 use crate::link::LinkStatusDto;
 use crate::dto::{
     cue_colour_css, AudioDeviceDto, AudioDevicesDto, CueDto, DeviceDto, DeviceExportDto, ExportReportDto,
-    EditHistoryDto, ImportReportDto, LibrarySummaryDto, LimiterDto, MissingTrackDto, MissingTracksDto, PhraseDto, RowDto,
+    EditHistoryDto, FolderPlaylistDto, ImportReportDto, LibrarySummaryDto, LimiterDto, PhraseDto, RowDto, UnanalysedTrackDto, UnanalysedTracksDto,
     TreeNodeDto, ViewHandleDto, ViewSpecDto,
     BackupDto, CountedDto, DeviceSyncStateDto, DuplicateGroupDto, DuplicateTrackDto, DuplicatesDto,
     ExportProgressDto, FilterValuesDto, ItunesLibraryDto, MissingExportFileDto, SmartConditionDto, SmartRuleDto, SyncDeviceReportDto, SyncPlaylistDto, SyncProgressDto, TagCategoryDto,
@@ -276,6 +276,10 @@ fn push_lists(
 
 #[tauri::command]
 pub async fn open_view(state: State<'_, Arc<AppState>>, spec: ViewSpecDto) -> AppResult<ViewHandleDto> {
+    // A stick's own library is read from the stick, not from the index.
+    if let crate::dto::TrackSourceDto::Device { path, format, playlist } = &spec.source {
+        return crate::device_library::open_view(&state, path.clone(), format.clone(), playlist.clone(), &spec).await;
+    }
     let library = state.library()?;
     // A folder is read from disk, not from the index, so it takes its own
     // path before the source is translated.
@@ -306,6 +310,9 @@ pub async fn fetch_rows(
             AppError::new(ErrorKind::Malformed, "Too many rows requested at once.")
                 .with_detail(format!("len {len} exceeds the {MAX_ROWS}-row cap")),
         );
+    }
+    if let Some(device) = state.device_view(view_id) {
+        return crate::device_library::fetch_rows(&device, offset, len);
     }
     let library = state.library()?;
     let extra_columns = extra_columns.unwrap_or_default();
@@ -348,9 +355,17 @@ fn enrich_rows(state: &AppState, rows: &mut [RowDto], columns: &[String]) -> App
     let wanted: Vec<&str> = columns.iter().map(String::as_str).filter(|column| FIELDS.contains(column)).collect();
     if wanted.is_empty() { return Ok(()); }
     state.read_db(|db| {
+        // The location rekordbox shows: the stored path through the drive
+        // substitution, or this machine's own cloud-shared track's local copy.
+        let track_paths = wanted.contains(&"location").then(|| db.track_paths());
         for row in rows {
             if row.id.starts_with("file:") { continue; }
             let Some(details) = rbl_db::details::browser_details(db.connection(), &row.id)? else { continue };
+            let cloud = details.path.starts_with("/contents_");
+            let location = match &track_paths {
+                Some(paths) => db.stored_path(&row.id)?.map_or_else(|| details.path.clone(), |stored| paths.location(&stored)),
+                None => String::new(),
+            };
             let mut values = serde_json::Map::new();
             for &column in &wanted {
                 let value: Value = match column {
@@ -367,7 +382,7 @@ fn enrich_rows(state: &AppState, rows: &mut [RowDto], columns: &[String]) -> App
                     "sampleRate" => json!(details.sample_rate),
                     "bitrate" => json!(details.bitrate),
                     "bitDepth" => json!(details.bit_depth),
-                    "location" => json!(details.path),
+                    "location" => json!(location),
                     "dateCreated" => json!(details.date_created),
                     "publishTrackInfo" => json!(details.publish),
                     "message" => json!(details.message),
@@ -375,7 +390,7 @@ fn enrich_rows(state: &AppState, rows: &mut [RowDto], columns: &[String]) -> App
                     "djPlayCount" => json!(details.play_count),
                     "myTag" => json!(rbl_db::details::my_tag_names(db.connection(), &row.id).join(", ")),
                     "trackNumber" => json!(details.track_number),
-                    "cloud" => json!(details.path.starts_with("/contents_")),
+                    "cloud" => json!(cloud),
                     _ => continue,
                 };
                 values.insert(column.to_owned(), value);
@@ -393,6 +408,9 @@ pub async fn view_ids_in_range(
     from: u32,
     to: u32,
 ) -> AppResult<Vec<String>> {
+    if let Some(device) = state.device_view(view_id) {
+        return Ok(crate::device_library::ids_in_range(&device, from, to));
+    }
     let library = state.library()?;
     if let Some(folder) = state.folder_view(view_id) {
         return crate::explorer::ids_in_range(library, folder, from, to).await;
@@ -622,7 +640,7 @@ where
 
 /// Commits an edit that must never be traversed by undo and invalidates all
 /// older tokens that could refer to rows the edit permanently removes.
-async fn permanent_edit<R: tauri::Runtime, F>(
+pub(crate) async fn permanent_edit<R: tauri::Runtime, F>(
     app: tauri::AppHandle<R>,
     state: State<'_, Arc<AppState>>,
     name: &'static str,
@@ -817,7 +835,7 @@ pub async fn start_link_export<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, Arc<AppState>>,
     interface: Option<String>,
-    alphanumeric_keys: Option<bool>,
+    device_settings: Option<rbl_prolink::DeviceSettings>,
     alphabetical_keys: Option<bool>,
 ) -> AppResult<LinkStatusDto> {
     if let Some(status) = state.link_status() {
@@ -832,12 +850,8 @@ pub async fn start_link_export<R: tauri::Runtime>(
     let owner = Arc::clone(&state);
     let emitter = app.clone();
     let library_emitter = app.clone();
+    let device_settings = device_settings.unwrap_or_default();
     let started = blocking("start_link_export", move || {
-        let key_notation = if alphanumeric_keys.unwrap_or(false) {
-            rbl_link::KeyNotation::Alphanumeric
-        } else {
-            rbl_link::KeyNotation::Classic
-        };
         let key_order = if alphabetical_keys.unwrap_or(false) {
             rbl_link::KeyOrder::Alphabetical
         } else {
@@ -846,7 +860,7 @@ pub async fn start_link_export<R: tauri::Runtime>(
         Ok(crate::link::Session::start(
             &owner,
             interface.as_deref(),
-            key_notation,
+            device_settings,
             key_order,
             move |status| {
                 let _ = tauri::Emitter::emit(&emitter, "link:status", status);
@@ -1092,9 +1106,12 @@ fn sync_one_device<R: tauri::Runtime>(
         },
         Err(e) => {
             progress("failed");
-            tracing::warn!(destination, error = %e, "sync to one device failed");
-            set_export_failure(app, stick, e.message.clone());
-            SyncDeviceReportDto { path: destination, report: None, error: Some(e.message), ejected: false, eject_error: None }
+            tracing::warn!(destination, error = %e, detail = e.detail.as_deref().unwrap_or(""), "sync to one device failed");
+            // The Sync Manager shows this line on its own, so an internal
+            // error's detail — what actually failed — goes with its summary.
+            let message = e.full_message();
+            set_export_failure(app, stick, message.clone());
+            SyncDeviceReportDto { path: destination, report: None, error: Some(message), ejected: false, eject_error: None }
         }
     }
 }
@@ -1245,11 +1262,46 @@ pub(crate) struct ExportSelection {
     pub sync: rbl_export::SyncSource,
 }
 
+/// What exporting the folder at `folder` writes, in tree order: the
+/// playlists (plain and intelligent) under it at any depth, and the folder
+/// itself with every folder under it, so empty ones keep their place.
+fn folder_contents(playlists: &rbl_index::Playlists, folder: usize) -> (Vec<usize>, Vec<usize>) {
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); playlists.len()];
+    for index in 0..playlists.len() {
+        if let Some(parent) = playlists.parent.get(index).copied().filter(|&p| p != rbl_index::NO_ID) {
+            if let Some(bucket) = children.get_mut(parent as usize) {
+                bucket.push(index);
+            }
+        }
+    }
+    let (mut leaves, mut folders) = (Vec::new(), Vec::new());
+    // Iterative, with a visited set, as the tree builder is: a corrupt
+    // parent cycle must not loop forever.
+    let mut visited = vec![false; playlists.len()];
+    let mut stack = vec![folder];
+    while let Some(index) = stack.pop() {
+        match visited.get_mut(index) {
+            Some(seen) if !*seen => *seen = true,
+            _ => continue,
+        }
+        if playlists.is_folder(index) {
+            folders.push(index);
+            if let Some(under) = children.get(index) {
+                stack.extend(under.iter().rev());
+            }
+        } else {
+            leaves.push(index);
+        }
+    }
+    (leaves, folders)
+}
+
 impl ExportSelection {
     /// The union of these playlists, each track read once however many of
     /// them hold it. Ids are the tree's numeric playlist ids. An intelligent
     /// playlist is exported as what its rule admits now, which is what
-    /// rekordbox writes to a stick for one too.
+    /// rekordbox writes to a stick for one too. A folder stands for every
+    /// playlist under it, and goes on the stick as a folder with them inside.
     pub(crate) fn from_playlists(
         state: &AppState,
         library: &rbl_index::Library,
@@ -1278,18 +1330,35 @@ impl ExportSelection {
         // Named first and read after: `source_rows` takes the playlists
         // itself, so the guard is let go before it is asked.
         let mut named: Vec<(u64, String, rbl_index::TrackSource)> = Vec::with_capacity(playlist_ids.len());
+        // Folders asked for by name, kept on the stick even when nothing
+        // under them is a playlist.
+        let mut chosen_folders: Vec<u64> = Vec::new();
         {
             let playlists = library.playlists();
+            let mut seen = std::collections::HashSet::new();
             for id in playlist_ids {
                 let Some(index) = id.parse::<u64>().ok().and_then(|numeric| playlists.index_of(numeric)) else {
                     return Err(AppError::new(ErrorKind::NotFound, "That playlist is not in the library."));
                 };
-                let source = if playlists.is_smart(index) {
-                    rbl_index::TrackSource::SmartPlaylist(index)
+                // A folder has no tracks of its own: exported as a playlist
+                // it would land on the stick empty.
+                let (leaves, folders) = if playlists.is_folder(index) {
+                    folder_contents(&playlists, index)
                 } else {
-                    rbl_index::TrackSource::Playlist(index)
+                    (vec![index], Vec::new())
                 };
-                named.push((playlists.ids.get(index).copied().unwrap_or(0), playlists.name(index).to_owned(), source));
+                chosen_folders.extend(folders.into_iter().filter_map(|folder| playlists.ids.get(folder).copied()));
+                for index in leaves {
+                    if !seen.insert(index) {
+                        continue;
+                    }
+                    let source = if playlists.is_smart(index) {
+                        rbl_index::TrackSource::SmartPlaylist(index)
+                    } else {
+                        rbl_index::TrackSource::Playlist(index)
+                    };
+                    named.push((playlists.ids.get(index).copied().unwrap_or(0), playlists.name(index).to_owned(), source));
+                }
             }
         }
         let rows_of: Vec<Vec<u32>> = named.iter().map(|(_, _, source)| library.source_rows(source)).collect();
@@ -1367,6 +1436,12 @@ impl ExportSelection {
             let mut parent = p.parent_id;
             while parent != 0 && ancestors.insert(parent) {
                 parent = sync.tree.iter().find(|n| n.id == parent).map_or(0, |n| n.parent);
+            }
+        }
+        for folder in chosen_folders {
+            let mut next = folder;
+            while next != 0 && ancestors.insert(next) {
+                next = sync.tree.iter().find(|n| n.id == next).map_or(0, |n| n.parent);
             }
         }
         let mut folders = Vec::new();
@@ -1542,6 +1617,25 @@ pub async fn eject_device(path: String) -> AppResult<()> {
     }).await
 }
 
+/// An export that failed because the USB went away mid-way says so: the
+/// error the file system gave ("Device not configured", "Input/output
+/// error", "No such file or directory") names a file, not the cause. What
+/// was written stays recoverable, and the next sync finishes or rolls it
+/// back.
+fn disconnected_during_export(destination: &std::path::Path, error: AppError) -> AppError {
+    // Cancelled is not a failure, and a stick that was gone before the sync
+    // began is already reported as such.
+    if matches!(error.kind, ErrorKind::Cancelled | ErrorKind::NotFound) || destination.is_dir() {
+        return error;
+    }
+    let detail = error.detail.clone().unwrap_or_else(|| error.message.clone());
+    AppError::new(
+        ErrorKind::NotFound,
+        "The USB was disconnected during the sync. Plug it back in and sync again; the sync picks up from there.",
+    )
+    .with_detail(detail)
+}
+
 fn write_export_with_progress<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     destination: &std::path::Path,
@@ -1586,7 +1680,8 @@ fn write_export_with_progress<R: tauri::Runtime>(
         },
         &mut |phase| emit(phase, if phase == "verifying" { total } else { done.get() }, String::new()),
         &|| cancel.load(std::sync::atomic::Ordering::Relaxed),
-    );
+    )
+    .map_err(|error| disconnected_during_export(destination, error));
     let cancelled = result.as_ref().err().is_some_and(|e| matches!(e.kind, ErrorKind::Cancelled));
     emit(if result.is_ok() { "done" } else if cancelled { "cancelled" } else { "failed" }, if result.is_ok() { total } else { done.get() },
         result.as_ref().err().map_or_else(String::new, |e| e.message.clone()));
@@ -1609,8 +1704,8 @@ fn write_export_with_phase(
             "That device is no longer connected. It may have been unplugged or renamed.",
         ));
     }
-    if rbl_db::is_rekordbox_running() {
-        return Err(AppError::internal("Quit rekordbox before syncing this USB so only one application writes its libraries."));
+    if rbl_db::is_rekordbox_app_running() {
+        return Err(AppError::new(ErrorKind::ReadOnly, "Quit rekordbox before syncing this USB so only one application writes its libraries."));
     }
     let preferred_root = rbl_devices::list()
         .into_iter()
@@ -1619,7 +1714,7 @@ fn write_export_with_phase(
     let root_name = rbl_export::export_root_name_with(destination, preferred_root)
         .map_err(|e| AppError::new(ErrorKind::Internal, e.to_string()))?;
     let export_root = destination.join(root_name);
-    let settings_root = dirs::data_dir().unwrap_or_else(std::env::temp_dir).join("rbxport/usb-settings");
+    let settings_root = crate::usb_import::settings_stash(&rbl_backup::state_dir());
     let imported_settings: Vec<_> = ["MYSETTING.DAT", "MYSETTING2.DAT", "DJMMYSETTING.DAT"].into_iter()
         .filter(|name| !export_root.join(name).exists())
         .filter_map(|name| std::fs::read(settings_root.join(name)).ok().map(|bytes| (name, bytes))).collect();
@@ -1651,8 +1746,11 @@ fn write_export_with_phase(
     phase("verifying");
     let check = rbl_export::verify_databases(destination)
         .map_err(|e| AppError::new(ErrorKind::Internal, e.to_string()))?;
-    if !check.is_ok() || check.tracks != report.tracks {
-        return Err(AppError::internal(format!("USB verification failed: missing audio {:?}; {}", check.missing_audio, check.errors.join("; "))));
+    if !check.is_ok() {
+        return Err(AppError::internal(format!("The USB did not verify after the sync: {}", rbl_export::verification_failure(&check))));
+    }
+    if check.tracks != report.tracks {
+        return Err(AppError::internal(format!("The USB did not verify after the sync: it lists {} tracks where {} were written.", check.tracks, report.tracks)));
     }
 
     Ok(ExportReportDto {
@@ -1822,15 +1920,28 @@ pub async fn deck_load<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, Arc<AppState>>,
     player: State<'_, Arc<crate::player::Player>>,
+    preview: State<'_, Arc<crate::preview::Preview>>,
     deck: String,
     track: String,
     load_id: u64,
 ) -> AppResult<()> {
+    // rekordbox's `ListViewer::loadTrack` stops the browser's preview before
+    // it loads, whether or not the load then succeeds: a track going onto a
+    // deck is not heard over a preview (#242).
+    preview.stop();
     let library = state.library()?;
     let Some(path) = library.audio_path_of(&track).map(std::path::PathBuf::from) else {
         return Err(AppError::new(ErrorKind::NotFound, "That track's file could not be found.")
             .with_detail(format!("track {track}")));
     };
+    // [OBS rekordbox 7.2.19 static] `UiPlayer::handleMessageDragAndDrop`
+    // @0x101abadc4 opens a track only when its file is there; otherwise the
+    // status bar says `kPlayerOperateErrorLoadMissingFile` (@0x101abb0f4)
+    // and the deck is left as it was.
+    if crate::relocate::is_missing_path(&path) {
+        return Err(AppError::new(ErrorKind::NotFound, crate::relocate::LOAD_MISSING_FILE)
+            .with_detail(format!("track {track}: {}", path.display())));
+    }
     let engine = player.engine(&app)?;
     let which = crate::player::deck_of(&deck);
     // The engine's own thread does the opening; this only hands it the path.
@@ -1882,6 +1993,21 @@ pub async fn deck_metronome<R: tauri::Runtime>(
 ) -> AppResult<()> {
     let engine = player.engine(&app)?;
     engine.set_metronome(crate::player::deck_of(&deck), on);
+    Ok(())
+}
+
+/// Gives a deck's metronome a grid at once, without a save. The GRID panel
+/// sends a nudged grid here before the file is written, so the click moves
+/// on the press.
+#[tauri::command]
+pub async fn deck_metronome_grid(
+    player: State<'_, Arc<crate::player::Player>>,
+    deck: String,
+    beats: Vec<(u32, bool)>,
+) -> AppResult<()> {
+    if let Some(engine) = player.opened() {
+        engine.set_metronome_grid(crate::player::deck_of(&deck), &beats);
+    }
     Ok(())
 }
 
@@ -1938,9 +2064,13 @@ pub async fn deck_unload(
 pub async fn deck_play<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     player: State<'_, Arc<crate::player::Player>>,
+    preview: State<'_, Arc<crate::preview::Preview>>,
     deck: String,
 ) -> AppResult<()> {
     let engine = player.engine(&app)?;
+    // A deck that plays stops the browser's preview, as rekordbox's does
+    // outside PERFORMANCE mode; the two are never heard over each other (#242).
+    preview.stop();
     engine.play(crate::player::deck_of(&deck));
     // The tick only runs while something is playing, so play is what starts it.
     crate::player::start_ticker(&app);
@@ -1953,10 +2083,13 @@ pub async fn deck_play<R: tauri::Runtime>(
 pub async fn deck_play_after<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     player: State<'_, Arc<crate::player::Player>>,
+    preview: State<'_, Arc<crate::preview::Preview>>,
     deck: String,
     delay_ms: f64,
 ) -> AppResult<()> {
     let engine = player.engine(&app)?;
+    // Held for a beat or not, this is the deck playing: see `deck_play`.
+    preview.stop();
     // Clamped to a positive number first: a delay is at most a beat, and a
     // negative or absurd one is zero rather than a wrapped count.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -1996,6 +2129,19 @@ pub async fn deck_seek<R: tauri::Runtime>(
         // So the interface sees where it landed even while paused, when no
         // tick is running.
         crate::player::start_ticker(&app);
+    }
+    Ok(())
+}
+
+/// Moves a deck's playhead by `by_ms` from where the engine has it.
+#[tauri::command]
+pub async fn deck_move(
+    player: State<'_, Arc<crate::player::Player>>,
+    deck: String,
+    by_ms: f64,
+) -> AppResult<()> {
+    if let Some(engine) = player.opened() {
+        engine.move_ms(crate::player::deck_of(&deck), by_ms);
     }
     Ok(())
 }
@@ -2056,10 +2202,14 @@ pub async fn deck_clear_loop<R: tauri::Runtime>(
 pub async fn set_master_level<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     player: State<'_, Arc<crate::player::Player>>,
+    preview: State<'_, Arc<crate::preview::Preview>>,
     level: f32,
 ) -> AppResult<()> {
     player.engine(&app)?;
     player.set_master_level(level);
+    // The browser's preview plays through its own engine and follows the
+    // same knob.
+    preview.set_master_level(level);
     Ok(())
 }
 
@@ -2233,9 +2383,12 @@ pub async fn master_limiter(
 #[tauri::command]
 pub async fn set_master_limiter(
     player: State<'_, Arc<crate::player::Player>>,
+    preview: State<'_, Arc<crate::preview::Preview>>,
     limiter: LimiterDto,
 ) -> AppResult<LimiterDto> {
-    Ok(player.set_limiter(limiter))
+    let set = player.set_limiter(limiter);
+    preview.set_limiter(set);
+    Ok(set)
 }
 
 /// Shows a track's file in the Finder.
@@ -2367,6 +2520,45 @@ pub async fn deck_state(
     }))
 }
 
+/// Previews a track from `position_ms` without loading it onto a deck: a
+/// click on the waveform in the browser's Preview column. See `preview.rs`
+/// for what rekordbox does and how that was established.
+#[tauri::command]
+pub async fn preview_play<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, Arc<AppState>>,
+    player: State<'_, Arc<crate::player::Player>>,
+    preview: State<'_, Arc<crate::preview::Preview>>,
+    track: String,
+    position_ms: f64,
+) -> AppResult<()> {
+    let library = state.library()?;
+    let Some(path) = library.audio_path_of(&track).map(std::path::PathBuf::from) else {
+        return Err(AppError::new(ErrorKind::NotFound, "That track's file could not be found.")
+            .with_detail(format!("track {track}")));
+    };
+    let decks = Arc::clone(&player);
+    let preview = Arc::clone(&preview);
+    // Waits on the file opening, which may be a disk waking up: off the
+    // async runtime.
+    blocking("preview_play", move || preview.play(&app, &decks, &track, &path, position_ms)).await
+}
+
+/// Stops the preview where it is.
+#[tauri::command]
+pub async fn preview_stop(preview: State<'_, Arc<crate::preview::Preview>>) -> AppResult<()> {
+    preview.stop();
+    Ok(())
+}
+
+/// The preview's track, whether it is playing, and where.
+#[tauri::command]
+pub async fn preview_state(
+    preview: State<'_, Arc<crate::preview::Preview>>,
+) -> AppResult<crate::preview::PreviewStateDto> {
+    Ok(preview.state())
+}
+
 /// A track's cue points.
 ///
 /// A hot cue's colour is what rekordbox paints for its `ColorTableIndex`,
@@ -2495,39 +2687,47 @@ pub async fn track_vocals(
     .map(tauri::ipc::Response::new)
 }
 
-/// Tracks whose audio file is no longer where the library says it is.
+/// A page of the Collection tracks Auto Analysis would analyse: never
+/// analysed, with their file where the library says.
 ///
-/// Bounded rather than exhaustive: a library can have thousands missing after
-/// a drive is unplugged, and a list that long is neither useful nor small
-/// enough for the IPC cap. The count is exact; the list is the first page.
+/// rekordbox offers these at launch when Auto Analysis is on ("Auto Analysis
+/// is starting.", OK/Cancel) [OBS: rekordbox 7.2.14 on chris-win11]. There can
+/// be thousands, so they come a page at a time from row `from`; `next` is the
+/// row to ask from for the next page, or `None` when the scan reached the end.
+/// The pages are rows rather than offsets into the result so each file is
+/// checked once however many pages are asked for.
 #[tauri::command]
-pub async fn missing_tracks(
+pub async fn unanalysed_tracks(
     state: State<'_, Arc<AppState>>,
+    from: u32,
     limit: u32,
-) -> AppResult<MissingTracksDto> {
+) -> AppResult<UnanalysedTracksDto> {
+    if limit == 0 || limit > MAX_ROWS {
+        return Err(
+            AppError::new(ErrorKind::Malformed, "That page size is not valid.")
+                .with_detail(format!("limit {limit} is outside 1..={MAX_ROWS}")),
+        );
+    }
     let library = state.library()?;
-    let wanted = (limit as usize).min(MAX_ROWS as usize);
-    blocking("missing_tracks", move || {
-        let mut missing = Vec::with_capacity(wanted);
-        let mut total = 0_u32;
-        for index in 0..library.len() {
-            let path = library.folder_path.get(index);
-            // An empty path is a track that never had a file, not one that
-            // lost it; those are a different problem.
-            if path.is_empty() || std::path::Path::new(path).exists() {
+    blocking("unanalysed_tracks", move || {
+        let wanted = limit as usize;
+        let mut tracks = Vec::with_capacity(wanted);
+        let mut next = None;
+        for row in library.unanalysed_rows(from) {
+            if tracks.len() == wanted {
+                next = Some(row);
+                break;
+            }
+            let index = row as usize;
+            if !std::path::Path::new(library.folder_path.get(index)).exists() {
                 continue;
             }
-            total = total.saturating_add(1);
-            if missing.len() < wanted {
-                missing.push(MissingTrackDto {
-                    id: library.ids.get(index).copied().unwrap_or(0).to_string(),
-                    title: library.title.get(index).to_owned(),
-                    artist: library.artist_name(u32::try_from(index).unwrap_or(0)).to_owned(),
-                    path: path.to_owned(),
-                });
-            }
+            tracks.push(UnanalysedTrackDto {
+                id: library.ids.get(index).copied().unwrap_or(0).to_string(),
+                title: library.title.get(index).to_owned(),
+            });
         }
-        Ok(MissingTracksDto { total, tracks: missing })
+        Ok(UnanalysedTracksDto { tracks, next })
     })
     .await
 }
@@ -2545,16 +2745,16 @@ const IMPORT_MAX_ENTRIES: usize = 500_000;
 ///
 /// A file the user picked is kept as chosen — even a non-audio one, so
 /// `import_file` still reports it as skipped rather than dropping it silently.
-/// A directory is walked breadth-first through its subdirectories, keeping
+/// A directory is walked the way rekordbox walks one (depth first, name order,
+/// hidden entries left alone; see [`rbl_db::import::audio_files_in`]), keeping
 /// only the audio files rekordbox plays; a cover-art `.jpg` sitting beside the
-/// tracks is simply not collected, not reported as skipped. Hidden
-/// directories (`.Trashes`, `.Spotlight-V100` and the like) are left alone.
+/// tracks is simply not collected, not reported as skipped.
 ///
 /// Pure filesystem work, so it runs under `blocking` with the writes below and
 /// never touches the async thread.
 fn expand_import_paths(paths: &[String]) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
-    let mut seen = 0_usize;
+    let mut budget = rbl_db::import::WalkBudget::new(IMPORT_MAX_DEPTH, IMPORT_MAX_ENTRIES);
     for path in paths {
         let path = std::path::Path::new(path);
         // Anything that is not a directory is imported exactly as chosen.
@@ -2562,33 +2762,10 @@ fn expand_import_paths(paths: &[String]) -> Vec<std::path::PathBuf> {
             files.push(path.to_path_buf());
             continue;
         }
-        let mut level = vec![path.to_path_buf()];
-        for _ in 0..IMPORT_MAX_DEPTH {
-            let mut next = Vec::new();
-            for dir in &level {
-                let Ok(entries) = std::fs::read_dir(dir) else { continue };
-                for entry in entries.flatten() {
-                    seen += 1;
-                    if seen > IMPORT_MAX_ENTRIES {
-                        return files;
-                    }
-                    let child = entry.path();
-                    let Ok(kind) = entry.file_type() else { continue };
-                    if kind.is_dir() {
-                        if entry.file_name().to_string_lossy().starts_with('.') {
-                            continue;
-                        }
-                        next.push(child);
-                    } else if kind.is_file() && rbl_db::import::is_audio(&child) {
-                        files.push(child);
-                    }
-                }
-            }
-            if next.is_empty() {
-                break;
-            }
-            level = next;
+        if budget.exhausted() {
+            break;
         }
+        files.extend(rbl_db::import::audio_files_in(path, &mut budget));
     }
     files
 }
@@ -2615,7 +2792,20 @@ pub async fn import_files<R: tauri::Runtime>(
                 let mut imported = 0_u32;
                 let mut skipped = Vec::new();
                 let mut tracks = Vec::new();
+                let mut existing = Vec::new();
                 for file in &files {
+                    // A file already in the library is not a failure: a drop
+                    // onto a playlist still wants that track in the playlist.
+                    if let Some(id) = writer.track_id_at(file)? {
+                        existing.push(crate::dto::ImportedTrackDto {
+                            id,
+                            title: file
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                        });
+                        continue;
+                    }
                     match writer.import_file(file) {
                         Ok(id) => {
                             imported += 1;
@@ -2633,7 +2823,7 @@ pub async fn import_files<R: tauri::Runtime>(
                         Err(other) => return Err(other),
                     }
                 }
-                Ok(ImportReportDto { imported, skipped, tracks })
+                Ok(ImportReportDto { imported, skipped, tracks, existing })
             })
             .map_err(write_error)
     })
@@ -2647,17 +2837,117 @@ pub async fn import_files<R: tauri::Runtime>(
     Ok(report)
 }
 
+/// A folder from Finder or Explorer dropped onto the Playlists root or a
+/// playlist folder: one playlist named after it, holding every audio file
+/// under it, subfolders flattened, the way rekordbox does it (see
+/// [`rbl_db::write::Writer::import_folder_as_playlist`]).
+///
+/// One folder per call, because a same-named sibling stops that folder until
+/// the user says whether to replace it: the clash comes back in `conflict`
+/// with nothing written, and the call is repeated with `replace` set to it.
+///
+/// `at` is the drop's insert index among `parent`'s children (`None`: the
+/// end). rekordbox puts every folder of one drop at that same index, so the
+/// caller passes each folder the `at` the previous one returned.
+#[tauri::command]
+pub async fn import_folder_playlist<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, Arc<AppState>>,
+    path: String,
+    parent: String,
+    replace: Option<String>,
+    at: Option<u32>,
+) -> AppResult<FolderPlaylistDto> {
+    let writing = Arc::clone(&state);
+    let report = blocking("import_folder_playlist", move || {
+        let dir = std::path::PathBuf::from(&path);
+        let name = dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut report = FolderPlaylistDto {
+            name: name.clone(),
+            playlist: None,
+            conflict: None,
+            folder: dir.is_dir(),
+            imported: 0,
+            skipped: Vec::new(),
+            tracks: Vec::new(),
+            existing: 0,
+            at,
+        };
+        if !report.folder || name.is_empty() {
+            return Ok(report);
+        }
+        let mut budget = rbl_db::import::WalkBudget::new(IMPORT_MAX_DEPTH, IMPORT_MAX_ENTRIES);
+        let files = rbl_db::import::audio_files_in(&dir, &mut budget);
+        let outcome = writing
+            .write(|writer| {
+                writer.import_folder_as_playlist(
+                    &name,
+                    &parent,
+                    &files,
+                    replace.as_deref(),
+                    at.and_then(|at| usize::try_from(at).ok()),
+                )
+            })
+            .map_err(write_error)?;
+        report.playlist = outcome.playlist;
+        report.conflict = outcome.conflict;
+        report.imported = u32::try_from(outcome.imported.len()).unwrap_or(u32::MAX);
+        report.existing = u32::try_from(outcome.existing.len()).unwrap_or(u32::MAX);
+        report.skipped = outcome.skipped;
+        report.at = outcome.at.map(|at| u32::try_from(at).unwrap_or(u32::MAX)).or(at);
+        report.tracks = outcome
+            .imported
+            .into_iter()
+            .map(|(id, file)| crate::dto::ImportedTrackDto {
+                id,
+                title: file
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            })
+            .collect();
+        if report.playlist.is_some() {
+            // An edit outside the undo history starts a new branch.
+            writing.edit_history.lock().clear_redo();
+        }
+        Ok(report)
+    })
+    .await?;
+
+    // Both the tree and, usually, the collection changed.
+    if report.playlist.is_some() {
+        reload(app, Arc::clone(&state)).await?;
+    }
+    Ok(report)
+}
+
+/// Relocate: points a track at the file chosen for it.
+///
+/// [OBS rekordbox 7.2.19 static, `MissingFileTable::showFileChooser`
+/// @0x1012a8408] A file the collection already holds is refused with "This
+/// file is already in the collection." and nothing is written; the answer
+/// is then `false`.
 #[tauri::command]
 pub async fn relocate_track<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, Arc<AppState>>,
     track: String,
     path: String,
-) -> AppResult<u32> {
+) -> AppResult<bool> {
+    let library = state.library()?;
+    let chosen = std::path::PathBuf::from(&path);
+    let held = blocking("relocate_track_check", move || Ok(library.row_for_path(&chosen).is_some())).await?;
+    if held {
+        return Ok(false);
+    }
     edit(app, state, "relocate_track", Touched::Tracks, move |w| {
         w.relocate(&track, std::path::Path::new(&path)).map(|_| ())
     })
-    .await
+    .await?;
+    Ok(true)
 }
 
 #[tauri::command]
@@ -3001,8 +3291,9 @@ pub async fn import_xml<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, Arc<AppState>>,
     path: String,
+    replace: Option<bool>,
 ) -> AppResult<XmlImportReportDto> {
-    import_collection(app, state, path, "import_xml", |text| {
+    import_collection(app, state, path, "import_xml", replace.unwrap_or(false), |text| {
         let document = rbl_db::xml::XmlLibrary::parse(text);
         if document.tracks.is_empty() && document.nodes.is_empty() {
             return Err(AppError::new(ErrorKind::Malformed, "That is not a rekordbox XML collection."));
@@ -3020,8 +3311,9 @@ pub async fn import_itunes<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, Arc<AppState>>,
     path: String,
+    replace: Option<bool>,
 ) -> AppResult<XmlImportReportDto> {
-    import_collection(app, state, path, "import_itunes", |text| {
+    import_collection(app, state, path, "import_itunes", replace.unwrap_or(false), |text| {
         rbl_db::itunes::parse(text)
             .ok_or_else(|| AppError::new(ErrorKind::Malformed, "That is not an iTunes or Music library file."))
     })
@@ -3095,13 +3387,14 @@ pub async fn import_itunes_selected<R: tauri::Runtime>(
     state: State<'_, Arc<AppState>>,
     path: String,
     ids: Vec<String>,
+    replace: Option<bool>,
 ) -> AppResult<XmlImportReportDto> {
     let keep: std::collections::BTreeSet<usize> =
         ids.iter().filter_map(|id| id.strip_prefix("itunes:").and_then(|n| n.parse().ok())).collect();
     if keep.is_empty() {
         return Err(AppError::new(ErrorKind::Malformed, "Select at least one iTunes playlist to import."));
     }
-    import_collection(app, state, path, "import_itunes_selected", move |text| {
+    import_collection(app, state, path, "import_itunes_selected", replace.unwrap_or(false), move |text| {
         let full = rbl_db::itunes::parse(text)
             .ok_or_else(|| AppError::new(ErrorKind::Malformed, "That is not an iTunes or Music library file."))?;
         Ok(rbl_db::xml::subset(&full, &keep))
@@ -3110,17 +3403,24 @@ pub async fn import_itunes_selected<R: tauri::Runtime>(
 }
 
 /// Reads a collection file with `parse` and imports what it holds.
+///
+/// A folder or playlist the file holds that already stands in the library
+/// under the same parent with the same name is replaced, as rekordbox does
+/// (issue #152) — but only with `replace`. Without it, and when there is one,
+/// nothing is written and the report's `same_named` lists them, so the caller
+/// can ask rekordbox's question and import again with `replace` on OK.
 async fn import_collection<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, Arc<AppState>>,
     path: String,
     name: &'static str,
+    replace: bool,
     parse: impl FnOnce(&str) -> AppResult<rbl_db::xml::XmlLibrary> + Send + 'static,
 ) -> AppResult<XmlImportReportDto> {
     let state_for_reload = Arc::clone(&state);
     let writing = Arc::clone(&state);
     let progress_app = app.clone();
-    let report = blocking(name, move || {
+    let (report, changed_playlists) = blocking(name, move || {
         let text = std::fs::read_to_string(&path).map_err(|e| {
             AppError::new(ErrorKind::NotFound, "That file could not be read.").with_detail(e.to_string())
         })?;
@@ -3138,20 +3438,49 @@ async fn import_collection<R: tauri::Runtime>(
                 },
             );
         };
-        let report = writing
-            .write(|writer| rbl_db::xml::import(writer, &document, &mut on_progress))
+        // Looked for under the same edit gate as the import, so nothing can
+        // make a same-named list between the question and the write.
+        let outcome = writing
+            .write(|writer| {
+                if !replace {
+                    let same_named = rbl_db::xml::same_named_lists(writer.library(), &document)?;
+                    if !same_named.is_empty() {
+                        return Ok(Err(same_named));
+                    }
+                }
+                on_progress(0, document.tracks.len());
+                rbl_db::xml::import(writer, &document, &mut on_progress).map(Ok)
+            })
             .map_err(write_error)?;
-        Ok(XmlImportReportDto {
+        let report = match outcome {
+            Ok(report) => report,
+            Err(same_named) => {
+                return Ok((XmlImportReportDto {
+                    imported: 0,
+                    existing: 0,
+                    skipped: Vec::new(),
+                    playlists: 0,
+                    cues: 0,
+                    tracks: Vec::new(),
+                    same_named,
+                }, false));
+            }
+        };
+        // A replaced playlist may have changed without a list or track being
+        // made: that, too, needs a reload.
+        let changed_playlists = report.playlist_tracks > 0 || report.playlists_replaced > 0;
+        Ok((XmlImportReportDto {
             imported: u32::try_from(report.imported).unwrap_or(u32::MAX),
             existing: u32::try_from(report.existing).unwrap_or(u32::MAX),
             skipped: report.skipped,
             playlists: u32::try_from(report.playlists).unwrap_or(u32::MAX),
             cues: u32::try_from(report.cues).unwrap_or(u32::MAX),
             tracks: report.tracks.into_iter().map(|(id, title)| crate::dto::ImportedTrackDto { id, title }).collect(),
-        })
+            same_named: Vec::new(),
+        }, changed_playlists))
     })
     .await?;
-    if report.imported > 0 || report.playlists > 0 {
+    if report.imported > 0 || report.playlists > 0 || changed_playlists {
         reload(app, state_for_reload).await?;
     }
     Ok(report)
@@ -3426,15 +3755,82 @@ pub async fn reorder_playlist<R: tauri::Runtime>(
     edit(app, state, "reorder_playlist", Touched::Playlists, move |w| w.reorder(&playlist, &tracks).map(|_| ())).await
 }
 
+/// Runs one track edit on each of `tracks` and keeps them as one step of
+/// history, so an edit made with several tracks selected undoes in one go.
+///
+/// rekordbox's information panel writes a multiple selection the same way:
+/// `TrackInfoConcreteMediator::updateDB` takes the whole selected array and
+/// sets the one value on each (7.2.11, static analysis).
+///
+/// Each track is its own transaction, so a failure partway through would
+/// leave the tracks before it changed with nothing in the history to take
+/// them back. The steps already written are undone, last first, before the
+/// error is returned: the edit lands on every track or on none. Ids that
+/// are no longer in the library are passed over first; the list keeps a
+/// selection's ids after the tracks behind them are removed.
+pub(crate) fn each_track<F>(
+    w: &mut rbl_db::write::Writer,
+    tracks: &[String],
+    mut edit: F,
+) -> Result<LibraryEdit, rbl_db::DbError>
+where
+    F: FnMut(&mut rbl_db::write::Writer, &str) -> Result<(rbl_db::write::Changed, rbl_db::write::TrackEdit), rbl_db::DbError>,
+{
+    let mut edits = Vec::with_capacity(tracks.len());
+    for track in tracks {
+        let step = match w.has_track(track) {
+            Ok(false) => continue,
+            Ok(true) => edit(w, track),
+            Err(error) => Err(error),
+        };
+        match step {
+            Ok((_, edit)) => {
+                if !edit.is_empty() {
+                    edits.push(edit);
+                }
+            }
+            Err(error) => return Err(roll_back(w, &edits, error)),
+        }
+    }
+    Ok(LibraryEdit::Track(edits))
+}
+
+/// Undoes `applied`, last first, after `error` stopped [`each_track`].
+/// Returns the error to report: `error` itself, or one that also says how
+/// many tracks could not be put back.
+fn roll_back(
+    w: &mut rbl_db::write::Writer,
+    applied: &[rbl_db::write::TrackEdit],
+    error: rbl_db::DbError,
+) -> rbl_db::DbError {
+    let mut stranded = 0usize;
+    for step in applied.iter().rev() {
+        if let Err(undo) = w.undo_track_edit(step) {
+            tracing::error!(error = %undo, "could not undo a track edit after a failed multi-track edit");
+            stranded += 1;
+        }
+    }
+    if stranded == 0 {
+        return error;
+    }
+    // `Io` displays the message as it is, with no prefix of its own.
+    rbl_db::DbError::Io(std::io::Error::other(format!(
+        "{error}; {stranded} of {} already-edited tracks could not be changed back",
+        applied.len()
+    )))
+}
+
+/// Rates every track in `tracks`: one track from the list, or the whole
+/// selection from the information panel.
 #[tauri::command]
 pub async fn set_track_rating<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, Arc<AppState>>,
-    track: String,
+    tracks: Vec<String>,
     stars: u8,
 ) -> AppResult<EditHistoryDto> {
-    recorded_edit(app, state, "set_track_rating", Touched::Metadata(vec![track.clone()]), "Track Edit", move |w| {
-        w.set_rating_with_undo(&track, stars).map(|(_, edit)| LibraryEdit::Track(vec![edit]))
+    recorded_edit(app, state, "set_track_rating", Touched::Metadata(tracks.clone()), "Track Edit", move |w| {
+        each_track(w, &tracks, |w, track| w.set_rating_with_undo(track, stars))
     }).await
 }
 
@@ -3442,11 +3838,11 @@ pub async fn set_track_rating<R: tauri::Runtime>(
 pub async fn set_track_comment<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, Arc<AppState>>,
-    track: String,
+    tracks: Vec<String>,
     comment: String,
 ) -> AppResult<EditHistoryDto> {
-    recorded_edit(app, state, "set_track_comment", Touched::Metadata(vec![track.clone()]), "Track Edit", move |w| {
-        w.set_comment_with_undo(&track, &comment).map(|(_, edit)| LibraryEdit::Track(vec![edit]))
+    recorded_edit(app, state, "set_track_comment", Touched::Metadata(tracks.clone()), "Track Edit", move |w| {
+        each_track(w, &tracks, |w, track| w.set_comment_with_undo(track, &comment))
     }).await
 }
 
@@ -3454,11 +3850,11 @@ pub async fn set_track_comment<R: tauri::Runtime>(
 pub async fn set_track_color<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, Arc<AppState>>,
-    track: String,
+    tracks: Vec<String>,
     color: Option<String>,
 ) -> AppResult<EditHistoryDto> {
-    recorded_edit(app, state, "set_track_color", Touched::Metadata(vec![track.clone()]), "Track Edit", move |w| {
-        w.set_color_with_undo(&track, color.as_deref()).map(|(_, edit)| LibraryEdit::Track(vec![edit]))
+    recorded_edit(app, state, "set_track_color", Touched::Metadata(tracks.clone()), "Track Edit", move |w| {
+        each_track(w, &tracks, |w, track| w.set_color_with_undo(track, color.as_deref()))
     }).await
 }
 
@@ -3501,6 +3897,90 @@ pub async fn filter_values(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::expand_import_paths;
+
+    /// An edit made with three tracks selected writes all three, and one
+    /// undo takes all three back: it is one step of history, as it is one
+    /// action in rekordbox's information panel.
+    #[test]
+    fn an_edit_over_several_tracks_is_written_to_each_and_undone_as_one() {
+        use crate::state::{AppState, LibraryEdit};
+        use rbl_db::write::TrackField;
+
+        let dir = tempfile::tempdir().unwrap();
+        let location = rbl_db::fixture::build(dir.path(), rbl_db::fixture::Shape::default()).unwrap();
+        let db = rbl_db::Library::open(location.clone(), rbl_db::OpenMode::ReadOnly).unwrap();
+        let (library, _) = rbl_index::load(&db).unwrap();
+        let state = AppState::with_backups(dir.path().join("backups"));
+        state.set_library(library, false, db.schema().db_version, 0, location);
+        crate::backups::create(&state).unwrap();
+        let tracks: Vec<String> = (1..=3).map(rbl_db::fixture::track_id).collect();
+        let untouched = rbl_db::fixture::track_id(4);
+        let genre = |state: &AppState, id: &str| {
+            state.read_db(|db| db.track_details(id)).unwrap().unwrap().genre
+        };
+
+        let edit = state
+            .write_then(
+                |w| super::each_track(w, &tracks, |w, track| w.set_field_with_undo(track, TrackField::Genre, "Techno")),
+                |_, edit| Ok(edit),
+            )
+            .unwrap();
+        let steps = match &edit {
+            LibraryEdit::Track(steps) => steps.len(),
+            _ => 0,
+        };
+        assert_eq!(steps, 3, "one track edit with a step per track");
+        for track in &tracks {
+            assert_eq!(genre(&state, track), "Techno");
+        }
+        assert_eq!(genre(&state, &untouched), "");
+
+        state.write_then(|w| super::apply_history(w, &edit, true), |_, ()| Ok(())).unwrap();
+        for track in &tracks {
+            assert_eq!(genre(&state, track), "", "undone on {track}");
+        }
+    }
+
+    /// A step that fails partway through a multiple selection takes back the
+    /// tracks already written, so the edit lands on all of them or on none:
+    /// each track is its own transaction, and a failed edit records nothing
+    /// an Undo could reach.
+    #[test]
+    fn a_failure_partway_through_several_tracks_puts_the_earlier_ones_back() {
+        use crate::state::AppState;
+        use rbl_db::write::TrackField;
+
+        let dir = tempfile::tempdir().unwrap();
+        let location = rbl_db::fixture::build(dir.path(), rbl_db::fixture::Shape::default()).unwrap();
+        let db = rbl_db::Library::open(location.clone(), rbl_db::OpenMode::ReadOnly).unwrap();
+        let (library, _) = rbl_index::load(&db).unwrap();
+        let state = AppState::with_backups(dir.path().join("backups"));
+        state.set_library(library, false, db.schema().db_version, 0, location);
+        crate::backups::create(&state).unwrap();
+        let tracks: Vec<String> = (1..=4).map(rbl_db::fixture::track_id).collect();
+        let failing = tracks[2].clone();
+        let genre = |state: &AppState, id: &str| {
+            state.read_db(|db| db.track_details(id)).unwrap().unwrap().genre
+        };
+
+        let result = state.write_then(
+            |w| {
+                super::each_track(w, &tracks, |w, track| {
+                    if track == failing {
+                        return Err(rbl_db::DbError::WriteRefused("disk full".to_owned()));
+                    }
+                    w.set_field_with_undo(track, TrackField::Genre, "Techno")
+                })
+            },
+            |_, edit| Ok(edit),
+        );
+
+        let error = result.err().expect("the failing step is reported");
+        assert!(error.to_string().contains("disk full"), "{error}");
+        for track in &tracks {
+            assert_eq!(genre(&state, track), "", "{track} is as it was");
+        }
+    }
 
     /// Sorted file names, so a filesystem-dependent walk order does not make
     /// the assertions flaky.

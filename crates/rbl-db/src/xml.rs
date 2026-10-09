@@ -13,15 +13,32 @@
 //! [`Writer::add_loop`] for the marks — so every row lands in the shape the
 //! writer already makes. A track whose file is already in the library is
 //! reused rather than doubled, and keeps its own cues.
+//!
+//! Importing a document whose folders or playlists already stand in the
+//! library (issue #152) replaces them, as rekordbox does, rather than making
+//! a second same-named list. rekordbox's
+//! `browse::TreeViewer::treeMessageImportPlaylistFromBridge` (rekordbox
+//! 7.2.19 arm64 @0x101569698) looks for a list with the same name first and
+//! asks, under the title "Import", "One or several lists with the same name
+//! already exist." and "Do you want to replace them with the one you're
+//! importing?" (OK/Cancel); on OK `DatabaseMediator::construct_master_playlist`
+//! (@0x100c5ca54) deletes the same-named lists (`rekordboxDBController::deleteList`
+//! through vtable slot 0x330, @0x100c5cd18) and makes the imported ones
+//! [OBS static]. Here [`same_named_lists`] finds them before anything is
+//! written, so the caller can ask, and [`import`] then replaces them: a
+//! same-named folder is kept as the container of what the document holds
+//! under it, and a same-named playlist ends up with exactly the document's
+//! tracks in the document's order, so tracks removed or reordered since the
+//! last import are applied. Lists the document does not name are left alone.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use rbl_core::xml::{attribute, tags, Tag};
 use rusqlite::params;
 
-use crate::write::{Writer, ROOT};
-use crate::Result;
+use crate::write::{Writer, ATTRIBUTE_FOLDER, ATTRIBUTE_PLAYLIST, ROOT};
+use crate::{Library, Result};
 
 /// One `POSITION_MARK`.
 #[derive(Debug, Clone, PartialEq)]
@@ -218,6 +235,13 @@ pub struct XmlImportReport {
     pub skipped: Vec<String>,
     /// Playlists and folders made.
     pub playlists: usize,
+    /// Playlists and folders already in the library under the same parent,
+    /// name and kind, replaced by the document's rather than made a second
+    /// time.
+    pub playlists_replaced: usize,
+    /// Membership rows written: tracks added to new playlists, and the tracks
+    /// of a replaced playlist whose contents or order changed.
+    pub playlist_tracks: usize,
     /// Cues and loops added to the tracks that were imported.
     pub cues: usize,
     /// The tracks that landed, `(id, title)`, so they can be analysed.
@@ -307,7 +331,7 @@ pub fn import(writer: &mut Writer, library: &XmlLibrary, progress: &mut dyn FnMu
             }
             Err(crate::DbError::WriteRefused(reason)) => {
                 // Already in the library: reused, with its own cues kept.
-                match existing_id(writer, path) {
+                match writer.track_id_at(path)? {
                     Some(id) => {
                         report.existing += 1;
                         ids.insert(track.id.as_str(), id);
@@ -321,25 +345,77 @@ pub fn import(writer: &mut Writer, library: &XmlLibrary, progress: &mut dyn FnMu
     }
 
     // The tree, in document order: a node's parent is the nearest open node
-    // one level up, so a stack of the ids made so far finds it.
+    // one level up, so a stack of the ids made or reused so far finds it.
     let mut parents: Vec<String> = vec![ROOT.to_owned()];
+    // Every node this run has made or reused, so two same-named siblings in
+    // the document pair off with two in the library rather than both landing
+    // in the first.
+    let mut claimed: HashSet<String> = HashSet::new();
     for node in &library.nodes {
         parents.truncate(node.depth + 1);
         let parent = parents.last().cloned().unwrap_or_else(|| ROOT.to_owned());
-        if node.folder {
-            let id = writer.create_folder(&node.name, &parent)?;
-            parents.push(id);
+        let attribute = if node.folder { ATTRIBUTE_FOLDER } else { ATTRIBUTE_PLAYLIST };
+        let members: Vec<String> = if node.folder {
+            Vec::new()
         } else {
-            let id = writer.create_playlist(&node.name, &parent)?;
-            let members: Vec<String> = node.track_ids.iter().filter_map(|key| ids.get(key.as_str()).cloned()).collect();
-            if !members.is_empty() {
-                writer.add_tracks(&id, &members)?;
+            let mut seen = HashSet::new();
+            node.track_ids
+                .iter()
+                .filter_map(|key| ids.get(key.as_str()).cloned())
+                .filter(|id| seen.insert(id.clone()))
+                .collect()
+        };
+        let id = if let Some(id) = existing_node(writer.library(), &parent, &node.name, attribute, &claimed)? {
+            report.playlists_replaced += 1;
+            if !node.folder {
+                // One transaction: a failure leaves the old members as they were.
+                report.playlist_tracks += writer.set_tracks(&id, &members)?.rows;
             }
-            parents.push(id);
-        }
-        report.playlists += 1;
+            id
+        } else {
+            report.playlists += 1;
+            let id = if node.folder {
+                writer.create_folder(&node.name, &parent)?
+            } else {
+                writer.create_playlist(&node.name, &parent)?
+            };
+            if !members.is_empty() {
+                report.playlist_tracks += writer.add_tracks(&id, &members)?.rows;
+            }
+            id
+        };
+        claimed.insert(id.clone());
+        parents.push(id);
     }
     Ok(report)
+}
+
+/// The names of the folders and playlists [`import`] would replace: those
+/// that already stand in the library under the same parent with the same
+/// name and kind, in document order. Read-only, so a caller can ask before
+/// importing, as rekordbox does.
+pub fn same_named_lists(library: &Library, document: &XmlLibrary) -> Result<Vec<String>> {
+    let mut found = Vec::new();
+    // The library's id of each open node, `None` below a node the import
+    // would make: nothing can stand under a list that does not exist yet.
+    let mut parents: Vec<Option<String>> = vec![Some(ROOT.to_owned())];
+    let mut claimed: HashSet<String> = HashSet::new();
+    for node in &document.nodes {
+        parents.truncate(node.depth + 1);
+        let existing = match parents.last() {
+            Some(Some(parent)) => {
+                let attribute = if node.folder { ATTRIBUTE_FOLDER } else { ATTRIBUTE_PLAYLIST };
+                existing_node(library, parent, &node.name, attribute, &claimed)?
+            }
+            _ => None,
+        };
+        if let Some(id) = &existing {
+            found.push(node.name.clone());
+            claimed.insert(id.clone());
+        }
+        parents.push(existing);
+    }
+    Ok(found)
 }
 
 /// The cues of a document track onto a library track. `Num` -1 is a memory
@@ -380,24 +456,36 @@ fn millis(secs: f64) -> u32 {
     (secs * 1000.0).round().clamp(0.0, f64::from(u32::MAX)) as u32
 }
 
-/// The library's id for a file already in it.
-fn existing_id(writer: &Writer, path: &Path) -> Option<String> {
-    let folder = path.to_string_lossy().into_owned();
-    writer
-        .library()
-        .connection()
-        .query_row(
-            "SELECT ID FROM djmdContent WHERE FolderPath = ?1 AND rb_local_deleted = 0",
-            params![folder],
-            |r| r.get::<_, String>(0),
-        )
-        .ok()
+/// A live folder or playlist under `parent` with this name and kind that this
+/// run has not used yet: the first in tree order.
+fn existing_node(
+    library: &Library,
+    parent: &str,
+    name: &str,
+    attribute: i64,
+    claimed: &HashSet<String>,
+) -> Result<Option<String>> {
+    let connection = library.connection();
+    let mut stmt = connection.prepare(
+        "SELECT ID FROM djmdPlaylist
+         WHERE ParentID = ?1 AND Name = ?2 AND Attribute = ?3 AND rb_local_deleted = 0
+         ORDER BY Seq, ID",
+    )?;
+    let ids = stmt.query_map(params![parent, name, attribute], |r| r.get::<_, String>(0))?;
+    for id in ids {
+        let id = id?;
+        if !claimed.contains(&id) {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     const DOC: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <DJ_PLAYLISTS Version="1.0.0">

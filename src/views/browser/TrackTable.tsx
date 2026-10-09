@@ -12,27 +12,31 @@ import { reportStartupPaint } from "@/lib/startup";
 import { useEventCallback } from "@/store/useEventCallback";
 import { TRACK_SEARCH_OPTIONS, type TrackSearchField } from "@/lib/search";
 
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { DeckId, RowDto, SortColumn, TrackField, ViewSpec } from "@/ipc/types";
 import { useTrackView, type PendingEdits, type Seed } from "@/store/useTrackView";
 import { PAGE_SIZE } from "@/lib/rowCache";
 import { SEEDED_ROWS } from "@/lib/session";
-import { formatBpm, formatBytes, formatDuration, formatShortDate } from "@/lib/format";
+import { formatBitrate, formatBpm, formatBytes, formatDuration, formatShortDate } from "@/lib/format";
 import {
-  applyClick, clickSettles, emptySelection, modifierFor, pressSelects, selectAll, type SelectionState,
+  applyClick, clickSettles, emptySelection, inListOrder, pressModifier, pressSelects, selectAll, selectedTracks,
+  type SelectionState,
 } from "@/lib/selection";
 import { ContextMenu } from "@/components/ContextMenu";
-import { trackMenuFor, type MenuTarget } from "@/lib/contextMenus";
-import { WaveformPreview } from "./WaveformPreview";
+import {
+  deleteKeyAction, deviceTrackMenu, MISSING_TRACK_MENU, MISSING_TRACK_TITLE, trackMenuFor, type MenuTarget,
+} from "@/lib/contextMenus";
+import { hasLooseId } from "@/lib/explorer";
+import { previewFromClick, WaveformPreview } from "./WaveformPreview";
 import styles from "./TrackTable.module.css";
 import { FilterIcon, SortDownIcon, SortUpIcon } from "@/components/icons";
 import { Artwork } from "@/components/Artwork";
 import { RatingStar } from "@/components/RatingStar";
 import { RecordIcon } from "@/components/icons";
-import { EXTRA_COLUMNS, type ColumnKey, type ColumnSpec } from "@/lib/columns";
+import { EXTRA_COLUMNS, reorderTarget, type ColumnKey, type ColumnSpec } from "@/lib/columns";
 import { COLOR_NAMES } from "@/lib/trackFilter";
-import { browseScale, formatKey } from "@/lib/preferences";
+import { browseListVars, browseScale, formatKey } from "@/lib/preferences";
 import { trafficLightLit, type TrafficLightReach } from "@/lib/camelot";
 import { TickIcon } from "@/components/icons";
 import type { TrafficLightSource } from "@/lib/session";
@@ -40,11 +44,18 @@ import { usePreferences, useTooltip } from "@/store/usePreferences";
 import type { KeyDisplay } from "@/ipc/types";
 import { ColumnMenu } from "./ColumnMenu";
 import { setRowDragImage } from "./dragGhost";
-import { detectPlatform, dispatch } from "@/lib/shortcuts";
+import { detectPlatform, dispatch, isTyping } from "@/lib/shortcuts";
 
 const ROW_H = 25; // --s-row-height
+/**
+ * A removal the list asks for: resolves true once the tracks are gone, false
+ * when the person declined or the write was refused.
+ */
+type RemoveTracks = (ids: readonly string[]) => Promise<boolean>;
 /** One frozen empty list, so a row without cues does not re-render for a new one. */
 const NO_CUES: RowDto["hotCues"] = [];
+/** macOS, where a Control-click is the context menu's press, not a toggle. */
+const MAC = detectPlatform().mac;
 /**
  * Rows to fetch beyond the rendered window in each direction, so a fast scroll
  * lands on pages that are already cached instead of on blank rows. Two pages
@@ -78,16 +89,9 @@ function totalWidthOf(columns: readonly ColumnSpec[]): number {
   return columns.reduce((a, c) => a + c.width, 0);
 }
 
-/** Which heading sits under an x position, by hit-testing the header row. */
-function columnAt(head: HTMLElement | null, x: number): number | null {
-  if (!head) return null;
-  const cells = [...head.children];
-  for (const [at, cell] of cells.entries()) {
-    const box = cell.getBoundingClientRect();
-    if (x >= box.left && x <= box.right) return at;
-  }
-  // Past the last heading: the far right.
-  return cells.length > 0 ? cells.length - 1 : null;
+/** The header row's headings, leaving out the floating copy of a dragged one. */
+function headingsOf(head: HTMLElement): Element[] {
+  return [...head.children].filter((cell) => cell.getAttribute("role") === "columnheader");
 }
 
 export function cellText(row: RowDto, key: Column["key"]): string {
@@ -119,7 +123,7 @@ export function cellText(row: RowDto, key: Column["key"]): string {
     case "publishTrackInfo": return value === true ? "On" : value === false ? "Off" : "";
     case "cloud": return value === true ? "Cloud" : "";
     case "sampleRate": return typeof value === "number" && value > 0 ? `${value / 1000} kHz` : "";
-    case "bitrate": return typeof value === "number" && value > 0 ? `${value} kbps` : "";
+    case "bitrate": return typeof value === "number" ? formatBitrate(value) : "";
     case "bitDepth": return typeof value === "number" && value > 0 ? `${value} bit` : "";
     case "year": case "discNo": case "djPlayCount": case "trackNumber":
       return typeof value === "number" && value > 0 ? String(value) : "";
@@ -430,7 +434,7 @@ const TrackRow = memo(function TrackRow({
       data-even={index % 2 === 1 || undefined}
       style={{ transform: `translate3d(0, ${top}px, 0)` }}
       onMouseDown={(e) => {
-        if (pressSelects(e, selected)) onSelect(index, row.id, e);
+        if (pressSelects(e, selected, MAC)) onSelect(index, row.id, e);
       }}
       onPointerDown={(e) => {
         suppressClick.current = false;
@@ -454,7 +458,10 @@ const TrackRow = memo(function TrackRow({
       // release has shown it was not a drag.
       onClick={(e) => {
         if (suppressClick.current) return;
-        if (clickSettles(e, selected)) onSelect(index, row.id, e);
+        if (clickSettles(e, selected, MAC)) onSelect(index, row.id, e);
+        // A click on the waveform also previews the track from there; the
+        // row is selected as well, as rekordbox's is.
+        if (row.analysed) previewFromClick(e, row.id, row.durationSec, previewCues ? row.hotCues : NO_CUES);
       }}
       onDoubleClick={() => onOpen(index)}
       onContextMenu={(e) => {
@@ -511,7 +518,14 @@ const TrackRow = memo(function TrackRow({
               {row.analysed ? (
                 <span className={styles.analysed} title={tooltips ? "Analyzed" : undefined} />
               ) : null}
-              <span className={styles.cue}>{row.hotCues.length > 0 ? "CUE" : ""}</span>
+              {row.missing === true ? (
+                // rekordbox's orange [!], where CUE would be: no missing row
+                // in either capture shows CUE beside it [OBS issue #201].
+                <span className={styles.missing} role="img" aria-label="File is Missing"
+                  title={tooltips ? "File is Missing" : undefined} />
+              ) : (
+                <span className={styles.cue}>{row.hotCues.length > 0 ? "CUE" : ""}</span>
+              )}
             </div>
           );
         }
@@ -717,12 +731,19 @@ export interface TrackTableProps {
   /** Right-click actions the table cannot do itself. */
   onShowInformation?: (row: RowDto) => void;
   onShowInFinder?: (row: RowDto) => void;
-  onRemoveFromPlaylist?: (ids: readonly string[]) => void;
-  onRemoveFromHistory?: (ids: readonly string[]) => void;
+  onRemoveFromPlaylist?: RemoveTracks;
+  onRemoveFromHistory?: RemoveTracks;
   onResetPlayCount?: (ids: readonly string[]) => void;
   /** Convert Memory Cues to Hot Cues, on the row under the pointer. */
   onConvertMemoryCues?: (row: RowDto) => void;
-  onRemoveFromCollection?: (ids: readonly string[]) => void;
+  onRemoveFromCollection?: RemoveTracks;
+  /** Auto Relocate, from a missing track's menu: the selected tracks. */
+  onAutoRelocate?: (ids: readonly string[]) => void;
+  /**
+   * Relocate, from a missing track's menu: every selected track, in list
+   * order, as rekordbox's `popupEventRelocateTrack` takes them.
+   */
+  onRelocate?: (ids: readonly string[]) => void;
   /** Import To Collection: the Explorer's files, by their `file:` ids. */
   onImportToCollection?: (ids: readonly string[]) => void;
   /** Analysis Lock › Lock and Unlock. */
@@ -730,13 +751,26 @@ export interface TrackTableProps {
   /** Add To Playlist › one of `playlists`. */
   onAddToPlaylist?: (playlist: string, ids: readonly string[]) => void;
   onAddToTagList?: (ids: readonly string[]) => void;
-  onRemoveFromTagList?: (ids: readonly string[]) => void;
+  onRemoveFromTagList?: RemoveTracks;
   /** Reload Tag: the files' tags read again. */
   onReloadTag?: (ids: readonly string[]) => void;
   /** Export Track › one of `devices`. */
   onExportTrack?: (device: string, ids: readonly string[]) => void;
   /** What Add To Playlist and Export Track offer. */
   playlists?: readonly MenuTarget[];
+  /**
+   * The menu over a stick's own tracks, when the view is one of its
+   * libraries: Add To Playlist naming that library's playlists, and in one
+   * of them Remove from Playlist.
+   */
+  deviceMenu?: {
+    playlists: readonly MenuTarget[];
+    inPlaylist: boolean;
+    /** The stick is being synced, exported or ejected: its edits are greyed. */
+    busy: boolean;
+    onAdd: (playlist: string, ids: readonly string[]) => void;
+    onRemove: (ids: readonly string[]) => void;
+  } | undefined;
   devices?: readonly MenuTarget[];
   /** rekordbox is running, so every write is refused rather than raced. */
   readOnly?: boolean;
@@ -789,9 +823,9 @@ export const TrackTable = memo(function TrackTable({
   onColumnAutoSizeAll, onFocusedRow, onDragTracks, dragging = false, onDropTracks, onDropFiles, onDragError, onRate, onComment, onReorder, onEditField, onEditBlocked, seed, onFirstRows,
   libraryGeneration, pendingEdits, onSelectedTracks, onAnalyse,
   onShowInformation, onShowInFinder, onRemoveFromPlaylist, onRemoveFromHistory, onResetPlayCount,
-  onRemoveFromCollection, onConvertMemoryCues, readOnly = false,
+  onRemoveFromCollection, onAutoRelocate, onRelocate, onConvertMemoryCues, readOnly = false,
   onImportToCollection, onAnalysisLock, onAddToPlaylist, onAddToTagList, onRemoveFromTagList, onExportTrack, onReloadTag,
-  playlists = [], devices = [],
+  playlists = [], devices = [], deviceMenu,
   players = 0, onLoadTrack, onSelectedRow, filterOpen = false, onToggleFilter, filterBar,
   trafficLight, onTrafficLight, trafficKey = null,
 }: TrackTableProps) {
@@ -824,7 +858,6 @@ export const TrackTable = memo(function TrackTable({
   const clickToEdit = !preferences.advanced.doubleClickToEdit;
   // Browse › FontSize and Line Space scale the measured tokens; the
   // virtualizer has to be told the same height the CSS draws.
-  const fontScale = browseScale(preferences.view.browseFontSize);
   const rowH = Math.round(ROW_H * browseScale(preferences.view.browseLineSpace));
 
   // Hand the top of the view up once it is real, for the next start's opening
@@ -854,11 +887,20 @@ export const TrackTable = memo(function TrackTable({
   // Live during a header-edge drag. A ref, not state: this updates per
   // mousemove and re-rendering the table on each would be a frame's work.
   const resizing = useRef<{ key: ColumnKey; x: number; width: number } | null>(null);
-  // A heading drag in progress, and whether it passed the threshold.
-  const reorder = useRef<{ key: ColumnKey; from: number; x: number; moved: boolean } | null>(null);
+  // A heading drag in progress, and whether it passed the threshold. `grab`
+  // is where in the heading it was taken, so the floating copy stays under
+  // the pointer at the same place.
+  const reorder = useRef<{ key: ColumnKey; x: number; grab: number; moved: boolean } | null>(null);
   // Set when a drag finishes, so the click that follows does not also sort.
   const draggedRef = useRef(false);
   const headRef = useRef<HTMLDivElement>(null);
+  // The floating copy of the heading being dragged. Moved by its own style
+  // on every mousemove rather than through state, so following the pointer
+  // costs no render.
+  const ghostRef = useRef<HTMLDivElement>(null);
+  const ghostLeft = useRef(0);
+  const columnsRef = useRef(columns);
+  columnsRef.current = columns;
 
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
@@ -868,21 +910,39 @@ export const TrackTable = memo(function TrackTable({
         return;
       }
       const move = reorder.current;
-      if (!move) return;
+      const head = headRef.current;
+      if (!move || !head) return;
       // A few pixels of slop, so a slightly imprecise click still sorts.
       if (!move.moved && Math.abs(e.clientX - move.x) < 5) return;
-      move.moved = true;
-      setDragKey(move.key);
+      if (!move.moved) {
+        move.moved = true;
+        setDragKey(move.key);
+      }
+      // rekordbox's drag: the heading floats with the pointer and the columns
+      // make room for it as it goes, so where it will land is always on show.
+      const current = columnsRef.current;
+      const at = current.findIndex((col) => col.key === move.key);
+      if (at === -1) return;
+      const origin = head.getBoundingClientRect().left;
+      const left = e.clientX - move.grab;
+      const width = current[at]?.width ?? 0;
+      ghostLeft.current = Math.round(left - origin);
+      if (ghostRef.current) ghostRef.current.style.transform = `translateX(${ghostLeft.current}px)`;
+      const spans = headingsOf(head).map((cell) => {
+        const box = cell.getBoundingClientRect();
+        return { left: box.left, right: box.right };
+      });
+      const first = current.filter((col) => col.fixed).length;
+      const to = reorderTarget(spans, at, left, left + width, first);
+      if (to !== at) onColumnMove(move.key, to);
     };
-    const onUp = (e: MouseEvent) => {
+    const onUp = () => {
       resizing.current = null;
       const move = reorder.current;
       reorder.current = null;
       setDragKey(null);
-      if (!move?.moved) return;
-      draggedRef.current = true;
-      const to = columnAt(headRef.current, e.clientX);
-      if (to !== null && to !== move.from) onColumnMove(move.key, to);
+      // Already where it belongs: the columns moved while it was held.
+      if (move?.moved) draggedRef.current = true;
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
@@ -1137,7 +1197,7 @@ export const TrackTable = memo(function TrackTable({
 
   const handleSelect = useEventCallback(
     (index: number, id: string, e: React.MouseEvent) => {
-      const modifier = modifierFor(e);
+      const modifier = pressModifier(e, MAC);
       if (modifier === "range" && selection.anchorIndex !== null) {
         const anchor = selection.anchorIndex;
         void view.idsInRange(anchor, index).then((ids) => {
@@ -1209,21 +1269,135 @@ export const TrackTable = memo(function TrackTable({
     [],
   );
 
+  // Whether the Delete key speaks to this list: rekordbox's list hears it
+  // only while it has the focus. The last press landed in this list, and
+  // nowhere else since — not the tree, the other list, a deck, a waveform or
+  // a button. A menu or a dialog opened from here gives the focus back.
+  const rootRef = useRef<HTMLDivElement>(null);
+  const engaged = useRef(false);
+  useEffect(() => {
+    const onDown = (event: MouseEvent) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (target === null) return;
+      if (rootRef.current?.contains(target)) engaged.current = true;
+      else if (!target.closest('[role="menu"], [role="dialog"]')) engaged.current = false;
+    };
+    window.addEventListener("mousedown", onDown, true);
+    return () => {
+      window.removeEventListener("mousedown", onDown, true);
+    };
+  }, []);
+
+  // Delete and ⌫ remove the whole selection the way this list's own menu
+  // entry does, asking first as it does: from the collection, a playlist, a
+  // history or the Tag List. rekordbox's list does the same with either key
+  // (#136). One press is one removal: a held key's repeats, and presses
+  // while one removal is still asking or writing, do nothing.
+  const removing = useRef(false);
+  const removeSelection = useEventCallback((event: KeyboardEvent) => {
+    if (event.key !== "Delete" && event.key !== "Backspace") return;
+    if (event.defaultPrevented || !engaged.current || trackMenu !== null) return;
+    // The key goes where the focus is: the page itself (a click on a row
+    // focuses nothing) or something inside this list, never a control.
+    const target = event.target instanceof HTMLElement ? event.target : null;
+    const inList = target !== null && rootRef.current?.contains(target) === true;
+    if (target !== null && !inList && target !== document.body && target !== document.documentElement) return;
+    if (isTyping(target) || target?.closest('[role="tree"], [role="dialog"], [role="menu"], button, [role="slider"], [role="spinbutton"]')) return;
+    // A key the person bound to something else in the Keyboard pane is theirs.
+    if (dispatch(event, platform, target, preferences.keyboard.overrides) !== null) return;
+    const action = deleteKeyAction(spec.source.kind);
+    if (action === null || selection.ids.size === 0 || hasLooseId(selection.ids)) return;
+    event.preventDefault();
+    if (event.repeat || removing.current) return;
+    if (readOnly) {
+      onEditBlocked?.();
+      return;
+    }
+    const remove: RemoveTracks | undefined = {
+      removeFromCollection: onRemoveFromCollection,
+      removeFromPlaylist: onRemoveFromPlaylist,
+      removeFromHistory: onRemoveFromHistory,
+      removeFromTagList: onRemoveFromTagList,
+    }[action];
+    if (remove === undefined) return;
+    const ids = [...selection.ids];
+    removing.current = true;
+    void remove(ids)
+      .then((removed) => {
+        // The removed rows are gone; a second press must not name them again.
+        if (!removed) return;
+        const gone = new Set(ids);
+        setSelection((current) => ({
+          ids: new Set([...current.ids].filter((id) => !gone.has(id))),
+          anchorIndex: current.anchorIndex,
+        }));
+      })
+      .finally(() => {
+        removing.current = false;
+      });
+  });
+  useEffect(() => {
+    window.addEventListener("keydown", removeSelection);
+    return () => {
+      window.removeEventListener("keydown", removeSelection);
+    };
+  }, [removeSelection]);
+
   const reportedSelection = useRef("");
+  // The list order of a selection the row cache could not order, asked of
+  // the backend once per selection and view; `order` is null while asked.
+  const listOrder = useRef<{ ids: ReadonlySet<string>; token: string; order: string[] | null } | null>(null);
   useEffect(() => {
     if (!onSelectedTracks) return;
-    const tracks: { id: string; title: string }[] = [];
-    for (let i = 0; i < view.count && tracks.length < selection.ids.size; i++) {
+    // Titles come from whatever pages are cached; the ids are the whole
+    // selection, cached or not. The scan runs top to bottom, so the titles
+    // map holds the cached selected rows in list order.
+    const titles = new Map<string, string>();
+    for (let i = 0; i < view.count && titles.size < selection.ids.size; i++) {
       const row = view.rowAt(i);
-      if (row && selection.ids.has(row.id)) tracks.push({ id: row.id, title: row.title });
+      if (row && selection.ids.has(row.id)) titles.set(row.id, row.title);
     }
-    // Only when it has actually changed. This hands a new array upwards, and
-    // the app holds it in state: sending an equal one re-renders the window,
-    // which renders this table, which runs this effect again.
-    const stamp = tracks.map((t) => t.id).join(",");
-    if (stamp === reportedSelection.current) return;
-    reportedSelection.current = stamp;
-    onSelectedTracks(tracks);
+    const report = (ids: Iterable<string>) => {
+      const tracks = selectedTracks(ids, titles);
+      // Only when it has actually changed. This hands a new array upwards, and
+      // the app holds it in state: sending an equal one re-renders the window,
+      // which renders this table, which runs this effect again.
+      const stamp = tracks.map((t) => t.id).join(",");
+      if (stamp === reportedSelection.current) return;
+      reportedSelection.current = stamp;
+      onSelectedTracks(tracks);
+    };
+    // An answer still on its way for another selection or view is dropped.
+    const known = listOrder.current;
+    if (known && (known.ids !== selection.ids || known.token !== view.token)) listOrder.current = null;
+    // Reported in list order, as rekordbox orders its selection (see
+    // `inListOrder`). With every selected row cached the scan above has the
+    // order already.
+    if (titles.size === selection.ids.size) {
+      report(titles.keys());
+      return;
+    }
+    // Some rows are not cached. Report the selection as it stands, so a
+    // command run straight after acts on all of it, then again in list order
+    // once the backend has sent the view's ids. A range or select-all is in
+    // list order already, which makes the second report a no-op. Pages
+    // arriving re-run this effect; they must not ask again.
+    if (listOrder.current) {
+      report(listOrder.current.order ?? selection.ids);
+      return;
+    }
+    report(selection.ids);
+    if (selection.ids.size < 2) return;
+    const asked = { ids: selection.ids, token: view.token, order: null as string[] | null };
+    listOrder.current = asked;
+    void view.idsInRange(0, view.count).then((listed) => {
+      if (listOrder.current !== asked) return;
+      asked.order = inListOrder(asked.ids, listed);
+      report(asked.order);
+    }).catch(() => {
+      // The order only decides which track's colour the information panel
+      // shows; the selection already reported stands.
+    });
   }, [selection.ids, view, onSelectedTracks]);
 
   // An arrow drawn to rekordbox's geometry rather than the text arrows that
@@ -1240,9 +1414,16 @@ export const TrackTable = memo(function TrackTable({
     [spec.sort, spec.descending],
   );
 
+  const dragged = dragKey === null ? undefined : columns.find((col) => col.key === dragKey);
+  // The copy mounts on the move that starts the drag; put it under the
+  // pointer before it paints rather than at the row's left edge.
+  useLayoutEffect(() => {
+    if (dragKey !== null && ghostRef.current) ghostRef.current.style.transform = `translateX(${ghostLeft.current}px)`;
+  }, [dragKey]);
+
   const header = useMemo(
     () =>
-      columns.map((col, at) => (
+      columns.map((col) => (
         <div
           key={col.key}
           className={col.align === "right" ? `${styles.headCell} ${styles.right}` : styles.headCell}
@@ -1253,8 +1434,9 @@ export const TrackTable = memo(function TrackTable({
             // drag-and-drop: marking the heading `draggable` makes the browser
             // treat a plain click as the start of a drag and swallow it, which
             // stopped the heading sorting at all.
-            if (e.button !== 0) return;
-            reorder.current = { key: col.key, from: at, x: e.clientX, moved: false };
+            if (e.button !== 0 || col.fixed) return;
+            const box = e.currentTarget.getBoundingClientRect();
+            reorder.current = { key: col.key, x: e.clientX, grab: e.clientX - box.left, moved: false };
           }}
           onClick={
             col.sortable
@@ -1299,6 +1481,7 @@ export const TrackTable = memo(function TrackTable({
 
   return (
     <div
+      ref={rootRef}
       className={styles.browser}
       style={{
         ["--cols" as string]: gridOf(columns),
@@ -1306,9 +1489,7 @@ export const TrackTable = memo(function TrackTable({
         // Browse › FontSize, Bold and Line Space, scoped to the list: the
         // tokens are the measured sizes, and these are the slider's multiples
         // of them.
-        ["--s-row-height" as string]: `${rowH}px`,
-        ["--f-size-ui" as string]: `calc(${fontScale} * var(--f-size-ui-base))`,
-        ["--browse-weight" as string]: preferences.view.browseBold ? 700 : 400,
+        ...browseListVars(preferences.view, ROW_H),
       }}
       data-file-over={fileOver || undefined}
       onDragOver={(e) => {
@@ -1445,6 +1626,17 @@ export const TrackTable = memo(function TrackTable({
         */}
         <div className={styles.colHead} role="row" ref={headRef}>
           {header}
+          {dragged ? (
+            <div
+              ref={ghostRef}
+              className={dragged.align === "right" ? `${styles.headCell} ${styles.right} ${styles.headGhost}` : `${styles.headCell} ${styles.headGhost}`}
+              style={{ width: `${dragged.width}px` }}
+              data-testid="column-drag-ghost"
+              aria-hidden
+            >
+              {dragged.label}
+            </div>
+          ) : null}
         </div>
 
         <div
@@ -1492,17 +1684,35 @@ export const TrackTable = memo(function TrackTable({
         </div>
       </div>
 
-      {trackMenu ? (
+      {trackMenu && deviceMenu && spec.source.kind === "device" ? (
         <ContextMenu
           x={trackMenu.x}
           y={trackMenu.y}
-          rows={trackMenuFor(players, playlists, devices, { tagList: spec.source.kind === "tagList" })}
+          rows={deviceTrackMenu(deviceMenu.playlists, deviceMenu.inPlaylist)}
+          label="Track"
+          context={{ inPlaylist: deviceMenu.inPlaylist, hasFile: true, readOnly: readOnly || deviceMenu.busy }}
+          onChoose={(action) => {
+            const ids = [...selection.ids];
+            if (action.startsWith("deviceAddToPlaylist:")) deviceMenu.onAdd(action.slice("deviceAddToPlaylist:".length), ids);
+            else if (action === "removeFromPlaylist") deviceMenu.onRemove(ids);
+          }}
+          onClose={() => setTrackMenu(null)}
+        />
+      ) : trackMenu ? (
+        <ContextMenu
+          x={trackMenu.x}
+          y={trackMenu.y}
+          rows={trackMenu.row.missing === true ? MISSING_TRACK_MENU : trackMenuFor(players, playlists, devices, {
+            tagList: spec.source.kind === "tagList",
+            explorer: spec.source.kind === "folder",
+          })}
+          title={trackMenu.row.missing === true ? MISSING_TRACK_TITLE : undefined}
           label="Track"
           context={{
             inPlaylist: spec.source.kind === "playlist",
             inHistory: spec.source.kind === "history",
             hasFile: true,
-            loose: spec.source.kind === "folder",
+            loose: hasLooseId(selection.ids),
             readOnly,
           }}
           onChoose={(action) => {
@@ -1529,7 +1739,7 @@ export const TrackTable = memo(function TrackTable({
                 onAddToTagList?.(ids);
                 break;
               case "removeFromTagList":
-                onRemoveFromTagList?.(ids);
+                void onRemoveFromTagList?.(ids);
                 break;
               case "reloadTag":
                 onReloadTag?.(ids);
@@ -1544,10 +1754,10 @@ export const TrackTable = memo(function TrackTable({
                 onShowInFinder?.(trackMenu.row);
                 break;
               case "removeFromPlaylist":
-                onRemoveFromPlaylist?.(ids);
+                void onRemoveFromPlaylist?.(ids);
                 break;
               case "removeFromHistory":
-                onRemoveFromHistory?.(ids);
+                void onRemoveFromHistory?.(ids);
                 break;
               case "resetPlayCount":
                 onResetPlayCount?.(ids);
@@ -1556,8 +1766,18 @@ export const TrackTable = memo(function TrackTable({
                 onConvertMemoryCues?.(trackMenu.row);
                 break;
               case "removeFromCollection":
-                onRemoveFromCollection?.(ids);
+                void onRemoveFromCollection?.(ids);
                 break;
+              case "autoRelocate":
+                onAutoRelocate?.(ids);
+                break;
+              case "relocate": {
+                const chosen = selection.ids;
+                void view.idsInRange(0, view.count)
+                  .then((listed) => onRelocate?.(inListOrder(chosen, listed)))
+                  .catch(() => onRelocate?.(ids));
+                break;
+              }
               case "loadPlayer1":
                 onLoadTrack?.("a", trackMenu.row);
                 break;

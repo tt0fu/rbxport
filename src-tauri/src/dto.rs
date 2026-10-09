@@ -40,6 +40,10 @@ pub struct RowDto {
     pub has_artwork: bool,
     /// The file's own name, for the Explorer's File Name column.
     pub file_name: String,
+    /// The file is not where the library says: rekordbox's `[!]` in the
+    /// Attribute column. Left out when false, which is nearly every row.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub missing: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra: Option<serde_json::Map<String, serde_json::Value>>,
 }
@@ -110,10 +114,27 @@ pub struct LimiterDto {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum LibraryProblemDto {
-    /// No library here at all, and one can be made at `master_db`.
+    /// No library configured anywhere, and one can be made at `master_db`.
     Missing { master_db: String },
+    /// A library is configured at `master_db`, not the default folder, and
+    /// is not there — most often a drive that is not connected. rekordbox's
+    /// "Cannot find Master Database" question: nothing is made in its place,
+    /// and Yes sets the default folder's `default_master_db` instead.
+    Unavailable { master_db: String, default_master_db: String },
     /// There is a library, or something in its place, and it would not open.
     Failed { message: String },
+}
+
+/// One entry of Database management's drive list.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseDriveDto {
+    /// The drive's name: its volume label, as rekordbox shows it.
+    pub name: String,
+    /// The library's `master.db` on that drive.
+    pub master_db: String,
+    /// Whether it is the library open now.
+    pub current: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -157,6 +178,11 @@ pub enum TrackSourceDto {
     /// The Tag List.
     #[serde(rename = "tagList")]
     TagList,
+    /// A library on a USB stick, as the Devices tree opens it: one of its
+    /// playlists, or every track for playlist `"0"`. `format` is
+    /// `deviceLibrary` or `oneLibrary`.
+    #[serde(rename = "device")]
+    Device { path: String, format: String, playlist: String },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -181,6 +207,7 @@ pub struct MissingTrackDto {
     pub id: String,
     pub title: String,
     pub artist: String,
+    pub album: String,
     /// Where the library still expects it.
     pub path: String,
 }
@@ -188,9 +215,26 @@ pub struct MissingTrackDto {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MissingTracksDto {
-    /// Every missing track, not just the ones listed.
+    /// Every missing track, not just the ones in this page.
     pub total: u32,
     pub tracks: Vec<MissingTrackDto>,
+}
+
+/// A track Auto Analysis would analyse.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnanalysedTrackDto {
+    pub id: String,
+    pub title: String,
+}
+
+/// One page of [`UnanalysedTrackDto`]s.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnanalysedTracksDto {
+    pub tracks: Vec<UnanalysedTrackDto>,
+    /// The row the next page starts from; `None` once the library is done.
+    pub next: Option<u32>,
 }
 
 /// One copy in a group of duplicates.
@@ -271,6 +315,34 @@ pub struct ImportReportDto {
     pub skipped: Vec<String>,
     /// The tracks that landed, so they can be queued for analysis.
     pub tracks: Vec<ImportedTrackDto>,
+    /// Files that were already in the library, with their existing track ids.
+    /// Not counted as imported or skipped.
+    pub existing: Vec<ImportedTrackDto>,
+}
+
+/// What dropping one folder onto the playlist tree did.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderPlaylistDto {
+    /// The folder's name, which is the playlist's.
+    pub name: String,
+    /// The playlist made, or `None` when nothing was written.
+    pub playlist: Option<String>,
+    /// A same-named sibling the user must agree to replace; nothing was
+    /// written. Call again with `replace` set to this id to replace it.
+    pub conflict: Option<String>,
+    /// False when the path was not a folder: rekordbox ignores loose files
+    /// dropped onto the Playlists root or a folder.
+    pub folder: bool,
+    pub imported: u32,
+    pub skipped: Vec<String>,
+    /// The tracks that landed, so they can be queued for analysis.
+    pub tracks: Vec<ImportedTrackDto>,
+    /// How many of the folder's files the library already held.
+    pub existing: u32,
+    /// The drop's insert index under the target, to pass to the next folder
+    /// of the same drop; `None` until one was worked out.
+    pub at: Option<u32>,
 }
 
 /// One track an import added.
@@ -402,6 +474,11 @@ pub struct XmlImportReportDto {
     pub cues: u32,
     /// The tracks that landed, so they can be queued for analysis.
     pub tracks: Vec<ImportedTrackDto>,
+    /// Folders and playlists already in the library under the same parent
+    /// with the same name, which the import would replace. When not empty,
+    /// nothing was imported: ask, as rekordbox does, then import again with
+    /// `replace`.
+    pub same_named: Vec<String>,
 }
 
 /// An iTunes / Music library read for the Sync Manager's iTunes column: where

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   autoSizeAll,
+  reorderTarget,
   autoSizeColumn,
   AVAILABLE_COLUMNS,
   CATALOGUE,
@@ -75,8 +76,15 @@ describe("the catalogue", () => {
     }
   });
 
-  it("allows the Comments heading to sort the view", () => {
-    expect(specOf("comment")?.sortable).toBe(true);
+  it("sorts by every heading rekordbox sorts by the field it shows", () => {
+    // rekordbox 7.2.11's `BrowseHeaderManager::isSortableColumn`: everything
+    // but Artwork, Preview, My Tag, Attribute and Cloud. Hot Cue is left out
+    // here because rekordbox sorts it by Hot Cue Auto Load, which this
+    // column does not show.
+    const unsortable = ["attr", "preview", "artwork", "hotCue", "myTag", "cloud"];
+    for (const column of CATALOGUE) {
+      expect(column.sortable, column.key).toBe(!unsortable.includes(column.key));
+    }
   });
 });
 
@@ -290,5 +298,35 @@ describe("the Explorer's layout", () => {
     expect(sanitise({ order: [] }, folderLayout).widths.preview).toBe(200);
     // And not otherwise: the collection's table keeps its own default.
     expect(sanitise(null).order).toEqual(defaultLayout().order);
+  });
+});
+
+describe("reorderTarget", () => {
+  // #, Preview, Title, Key: 47, 128, 387 and 73 wide.
+  const spans = [
+    { left: 0, right: 47 },
+    { left: 47, right: 175 },
+    { left: 175, right: 562 },
+    { left: 562, right: 635 },
+  ];
+
+  it("stays put until the floating heading passes a neighbour's middle", () => {
+    expect(reorderTarget(spans, 3, 400, 473, 1)).toBe(3);
+    expect(reorderTarget(spans, 3, 368, 441, 1)).toBe(2);
+  });
+
+  it("moves right once the floating heading's right edge passes the next middle", () => {
+    expect(reorderTarget(spans, 1, 200, 328, 1)).toBe(1);
+    expect(reorderTarget(spans, 1, 250, 378, 1)).toBe(2);
+    expect(reorderTarget(spans, 1, 560, 688, 1)).toBe(3);
+  });
+
+  it("does not swap a narrow heading back and forth over a wide one", () => {
+    // Key dragged left by a few pixels into Title's box: not past its middle.
+    expect(reorderTarget(spans, 3, 540, 613, 1)).toBe(3);
+  });
+
+  it("never moves in front of the fixed columns", () => {
+    expect(reorderTarget(spans, 1, -40, 88, 1)).toBe(1);
   });
 });

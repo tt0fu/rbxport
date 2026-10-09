@@ -27,12 +27,14 @@ mod file_journal;
 mod new_library;
 mod diagnostics;
 mod explorer;
+mod device_library;
 mod link;
 mod rx3_link;
 mod network_labels;
 pub mod logging;
 pub mod menu;
 pub mod player;
+pub mod preview;
 mod preferences;
 mod browse_settings;
 mod protocol;
@@ -45,9 +47,15 @@ pub mod dto;
 mod error;
 pub mod state;
 mod test_port;
+mod elevated_update;
 mod update;
 
 pub use error::{AppError, AppResult, ErrorKind};
+
+/// Runs the protected Windows update entry point before Tauri starts.
+pub fn run_elevated_update_helper_if_requested() -> Option<i32> {
+    update::run_elevated_helper_if_requested()
+}
 
 use state::AppState;
 use std::sync::Arc;
@@ -176,12 +184,12 @@ pub(crate) fn spawn_library_load(app: tauri::AppHandle) {
             }
             Err(e) => {
                 // Nothing to open, as against something that would not open:
-                // offered as a new library rather than reported as a failure.
-                if let Ok(Some(plan)) = rbl_db::new_library::plan() {
-                    tracing::info!(path = %plan.master_db.display(), error = %e, "no library here; offering to make one");
-                    report_problem(&app, dto::LibraryProblemDto::Missing {
-                        master_db: plan.master_db.display().to_string(),
-                    });
+                // no library anywhere, or one configured on a drive that is
+                // not connected. Both are questions for the window rather
+                // than failures.
+                if let Some(problem) = rbl_db::locate::locate().ok().as_ref().and_then(new_library::problem_from) {
+                    tracing::info!(?problem, error = %e, "no library to open; asking");
+                    report_problem(&app, problem);
                     return;
                 }
                 tracing::error!(error = %e, "could not open the library");
@@ -397,6 +405,7 @@ pub fn run() {
         .plugin(window_geometry())
         .manage(Arc::new(AppState::new()))
         .manage(Arc::new(crate::player::Player::default()))
+        .manage(Arc::new(crate::preview::Preview::default()))
         .manage(Arc::new(crate::grid::GridEditor::default()))
         .manage(Arc::new(crate::update::Updates::default()))
         .manage(crate::test_port::TestPort::default())
@@ -476,6 +485,9 @@ pub fn run() {
             commands::disable_read_only,
             new_library::library_problem,
             new_library::create_library,
+            new_library::use_default_library,
+            new_library::database_drives,
+            new_library::switch_library,
             commands::playlist_tree,
             commands::open_view,
             commands::fetch_rows,
@@ -512,6 +524,7 @@ pub fn run() {
             commands::deck_play_after,
             commands::deck_pause,
             commands::deck_seek,
+            commands::deck_move,
             commands::deck_scrub_begin,
             commands::deck_scrub_to,
             commands::deck_scrub_end,
@@ -530,6 +543,7 @@ pub fn run() {
             update::restart_to_update,
             commands::deck_tempo,
             commands::deck_metronome,
+            commands::deck_metronome_grid,
             commands::deck_key_shift,
             commands::set_metronome,
             commands::set_audio_config,
@@ -540,6 +554,9 @@ pub fn run() {
             commands::set_crossfade,
             commands::set_eq_curve,
             commands::deck_state,
+            commands::preview_play,
+            commands::preview_stop,
+            commands::preview_state,
             commands::track_cues,
             // The GRID panel: every one rewrites the track's analysis files
             // and is refused while rekordbox runs, like the edits above.
@@ -550,11 +567,16 @@ pub fn run() {
             grid::grid_lock,
             commands::track_phrases,
             commands::track_vocals,
-            commands::missing_tracks,
+            relocate::missing_tracks,
+            relocate::remove_missing_tracks,
+            commands::unanalysed_tracks,
             commands::find_duplicates,
             commands::import_files,
+            commands::import_folder_playlist,
             commands::relocate_track,
             relocate::auto_relocate,
+            relocate::relocation_targets,
+            relocate::relocate_by_location,
             preferences::open_preferences,
             sync_window::open_sync_window,
             report::open_report_window,
@@ -623,9 +645,12 @@ pub fn run() {
             device_settings::ensure_device_library,
             explorer::explorer_roots,
             explorer::explorer_children,
+            device_library::device_libraries,
+            device_library::device_playlist_edit,
             // The information panel: one track's full record, the lookup
             // lists its dropdowns offer, and the fields it may write.
             details::track_details,
+            details::selection_details,
             details::track_lookups,
             details::set_track_field,
             details::add_artwork,

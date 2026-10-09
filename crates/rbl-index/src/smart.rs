@@ -15,7 +15,15 @@
 //! less, in range, in the last, not in the last, contains, does not contain,
 //! starts with, ends with. The property names are rekordbox's own internal
 //! ones (`name` is the title, `counter` the play count, `grouping` the
-//! colour, `producer` the composer, `stockDate` the date added).
+//! colour, `producer` the composer, `stockDate` the date added, `myTag` a
+//! My Tag).
+//!
+//! A `myTag` condition names the tag by its `djmdMyTag.ID` in `ValueLeft`
+//! and is answered from the track's tags (`djmdSongMyTag`) [OBS: static,
+//! rekordbox 7.2.19 arm64 `db::getSmartlistCondition` reads `ValueLeft` with
+//! `XmlElement::getIntAttribute` for `myTag`, and `db::operate` answers that
+//! property only for operator 8 (the tag is among the track's) and 9 (it is
+//! not, which an untagged track satisfies); every other operator is false].
 //!
 //! Read with `rbl_core::xml`'s scanner: the document is a flat handful of
 //! elements with quoted attributes, and a rule that does not parse is
@@ -121,6 +129,8 @@ pub enum Property {
     DateAdded,
     DateCreated,
     DateReleased,
+    /// A My Tag, by its `djmdMyTag.ID`.
+    MyTag,
     /// A property the index does not hold. Never matches.
     Unsupported,
 }
@@ -153,6 +163,7 @@ impl Property {
             Self::DateAdded => "stockDate",
             Self::DateCreated => "dateCreated",
             Self::DateReleased => "dateReleased",
+            Self::MyTag => "myTag",
             Self::Unsupported => "",
         }
     }
@@ -183,6 +194,7 @@ impl Property {
             ("stockDate", Self::DateAdded),
             ("dateCreated", Self::DateCreated),
             ("dateReleased", Self::DateReleased),
+            ("myTag", Self::MyTag),
         ] {
             if name.eq_ignore_ascii_case(candidate) {
                 return property;
@@ -466,6 +478,7 @@ impl CompiledCondition {
                 (whole(&condition.left), whole(&condition.right))
             }
             Property::Color => (color_id(&condition.left), color_id(&condition.right)),
+            Property::MyTag => (i64::from(my_tag_key(&condition.left)), 0),
             Property::DateAdded | Property::DateCreated | Property::DateReleased => {
                 match condition.operator {
                     Operator::InLast | Operator::NotInLast => {
@@ -562,6 +575,7 @@ impl CompiledCondition {
                 self.date_matches(lib.date_added.get(index))
             }
             Property::DateReleased => self.date_matches(lib.release_date.get(index)),
+            Property::MyTag => self.tag_matches(lib.my_tag_keys(index)),
             Property::Unsupported => false,
         }
     }
@@ -607,6 +621,18 @@ impl CompiledCondition {
             | Operator::NotContains
             | Operator::StartsWith
             | Operator::EndsWith => false,
+        }
+    }
+
+    /// rekordbox's `myTag` comparison: whether the tag is among the
+    /// track's. Only "contains" and "does not contain" answer; see the
+    /// module notes.
+    fn tag_matches(&self, keys: &[i32]) -> bool {
+        let wanted = i32::try_from(self.low).unwrap_or_default();
+        match self.operator {
+            Operator::Contains => keys.contains(&wanted),
+            Operator::NotContains => !keys.contains(&wanted),
+            _ => false,
         }
     }
 
@@ -691,6 +717,45 @@ fn relative_count(text: &str) -> i64 {
     text.trim().parse::<i64>().unwrap_or(0).max(0)
 }
 
+/// A My Tag id as rekordbox compares it: the text read as a 32-bit signed
+/// integer the way JUCE's `String::getIntValue` reads it — leading
+/// whitespace skipped, an optional sign, then decimal digits up to the
+/// first non-digit, anything unreadable 0 [OBS: static, rekordbox 7.2.19
+/// reads both the rule's `ValueLeft` and compares the track's tags as
+/// 32-bit integers]. Ids past 2^31 wrap [ASSUME: the compiled loop's
+/// two's-complement overflow; `djmdMyTag.ID` values that large have not
+/// been seen in a captured library, and rekordbox's
+/// `DatabaseMediator::fixMyTagIdsInSmartlistCriteria` rewrites a rule's
+/// `ValueLeft` with `setAttribute(…, int)`, which would write the wrapped
+/// value]. Reading the track's `djmdSongMyTag.MyTagID` the same way is
+/// [ASSUME]: where rekordbox fills a track's tag list was not traced.
+#[must_use]
+pub fn my_tag_key(text: &str) -> i32 {
+    let mut chars = text.trim_start().chars().peekable();
+    let negative = match chars.peek() {
+        Some('-') => {
+            chars.next();
+            true
+        }
+        Some('+') => {
+            chars.next();
+            false
+        }
+        _ => false,
+    };
+    let mut value: i32 = 0;
+    for c in chars {
+        let Some(digit) = c.to_digit(10) else { break };
+        let digit = i32::try_from(digit).unwrap_or_default();
+        value = value.wrapping_mul(10).wrapping_add(digit);
+    }
+    if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    }
+}
+
 /// A colour by its `ColorID`, or by name for a rule written with one.
 fn color_id(text: &str) -> i64 {
     let text = text.trim();
@@ -744,8 +809,9 @@ impl Date {
     }
 
     /// The inclusive start of a relative-date window. A case-insensitive
-    /// singular `month` steps the calendar; every other spelling counts days,
-    /// with today as the first day.
+    /// singular `month` starts on the last day of the month that many months
+    /// back (so today's month never counts as one); every other spelling
+    /// counts days, with today as the first day.
     #[must_use]
     pub fn minus(self, count: i64, unit: &str) -> Self {
         if unit.eq_ignore_ascii_case("month") {
@@ -759,30 +825,25 @@ impl Date {
         Self::from_days(self.days() - count)
     }
 
+    /// The last day of the month `count` months before this one (a count
+    /// below one acts as one), which is the first day of the window.
+    /// [OBS: static, rekordbox 7.2.19 arm64 `db::pastMonthToDay` takes
+    /// `max(count - 1, 0)`, subtracts it from the current month, sets the
+    /// day of month to 0 and passes the result through `mktime`, which
+    /// normalises it to the last day of the month before; the five cutoffs
+    /// in issue #255 fit]. `db::pastMonthToDay` then divides the `mktime`
+    /// result by 86400 with no local-offset correction, so its day can be
+    /// off by one around midnight [UNKNOWN: not reproduced here].
     fn months_back(self, count: i64) -> Self {
-        let total = self.year * 12 + (self.month - 1) - count;
+        let total = self.year * 12 + (self.month - 1) - count.max(1) + 1;
         let year = total.div_euclid(12);
         let month = total.rem_euclid(12) + 1;
-        Self { year, month, day: self.day.min(days_in_month(year, month)) }
+        Self::from_days(days_from_civil(year, month, 1) - 1)
     }
 
     fn from_days(days: i64) -> Self {
         let (year, month, day) = civil_from_days(days);
         Self { year, month, day }
-    }
-}
-
-fn days_in_month(year: i64, month: i64) -> i64 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        _ => {
-            if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
-                29
-            } else {
-                28
-            }
-        }
     }
 }
 
@@ -917,6 +978,34 @@ mod tests {
         assert_eq!(SmartRule::parse(&xml).unwrap(), rule);
     }
 
+    /// [OBS: issue #255, rekordbox on 2026-10-09] The first included day of
+    /// "in the last N months" is the last day of the month N months back.
+    #[test]
+    fn months_window_starts_on_the_last_day_of_the_month_n_months_back() {
+        let day = |y, m, d| Date { year: y, month: m, day: d };
+        let today = day(2026, 10, 9);
+        assert_eq!(today.minus(4, "month"), day(2026, 6, 30));
+        assert_eq!(today.minus(6, "month"), day(2026, 4, 30));
+        assert_eq!(today.minus(9, "month"), day(2026, 1, 31));
+        assert_eq!(today.minus(12, "month"), day(2025, 10, 31));
+        assert_eq!(today.minus(36, "month"), day(2023, 10, 31));
+        // The day of the month never matters, only the month.
+        assert_eq!(day(2026, 10, 1).minus(4, "month"), day(2026, 6, 30));
+        assert_eq!(day(2026, 10, 31).minus(4, "month"), day(2026, 6, 30));
+        // Month ends: from 31 January and 31 March, and a leap February.
+        assert_eq!(day(2026, 1, 31).minus(1, "month"), day(2025, 12, 31));
+        assert_eq!(day(2026, 3, 31).minus(1, "month"), day(2026, 2, 28));
+        assert_eq!(day(2024, 3, 31).minus(1, "month"), day(2024, 2, 29));
+        assert_eq!(day(2024, 5, 15).minus(3, "month"), day(2024, 2, 29));
+        assert_eq!(day(2024, 3, 1).minus(12, "month"), day(2023, 3, 31));
+        // Year rollover.
+        assert_eq!(day(2026, 2, 14).minus(2, "month"), day(2025, 12, 31));
+        assert_eq!(day(2026, 1, 5).minus(13, "month"), day(2024, 12, 31));
+        // A count below one acts as one [OBS: `max(count - 1, 0)`].
+        assert_eq!(today.minus(0, "month"), day(2026, 9, 30));
+        assert_eq!(today.minus(-3, "month"), day(2026, 9, 30));
+    }
+
     #[test]
     fn relative_dates_only_treat_singular_month_as_a_calendar_unit() {
         let d = Date::parse("2026-03-31 10:00:00").unwrap();
@@ -984,6 +1073,53 @@ mod tests {
         assert!(!condition(Operator::NotEqual, "2025-01-31").date_matches("not-a-date"));
         assert!(condition(Operator::NotEqual, "not-a-date").date_matches("2025-01-31"));
         assert!(!condition(Operator::Equal, "not-a-date").date_matches("2025-01-31"));
+    }
+
+    #[test]
+    fn my_tag_ids_are_read_as_juce_reads_an_int_attribute() {
+        assert_eq!(my_tag_key("700002"), 700_002);
+        assert_eq!(my_tag_key("  +42abc"), 42);
+        assert_eq!(my_tag_key("-7"), -7);
+        assert_eq!(my_tag_key(""), 0);
+        assert_eq!(my_tag_key("tag"), 0);
+        // Past 2^31 the id wraps, so the wrapped form a rewritten rule holds
+        // still names the same tag.
+        assert_eq!(my_tag_key("3000000000"), my_tag_key("-1294967296"));
+    }
+
+    #[test]
+    fn a_my_tag_condition_answers_only_contains_and_does_not_contain() {
+        let rule = SmartRule::parse(
+            r#"<NODE LogicalOperator="1"><CONDITION PropertyName="myTag" Operator="8" ValueLeft="12" ValueRight=""/></NODE>"#,
+        )
+        .unwrap();
+        let Item::Condition(condition) = &rule.root.items[0] else { panic!() };
+        assert_eq!(condition.property, Property::MyTag);
+        assert_eq!(rule.unsupported(), 0);
+
+        let compiled = |operator: Operator| {
+            CompiledCondition::from(
+                &Condition {
+                    property: Property::MyTag,
+                    operator,
+                    left: "12".to_owned(),
+                    right: String::new(),
+                    unit: String::new(),
+                },
+                &Library::default(),
+                &Date { year: 2025, month: 1, day: 31 },
+            )
+        };
+        assert!(compiled(Operator::Contains).tag_matches(&[3, 12]));
+        assert!(!compiled(Operator::Contains).tag_matches(&[3]));
+        assert!(!compiled(Operator::Contains).tag_matches(&[]));
+        assert!(compiled(Operator::NotContains).tag_matches(&[]));
+        assert!(compiled(Operator::NotContains).tag_matches(&[3]));
+        assert!(!compiled(Operator::NotContains).tag_matches(&[12]));
+        for operator in [Operator::Equal, Operator::NotEqual, Operator::Greater, Operator::StartsWith] {
+            assert!(!compiled(operator).tag_matches(&[12]));
+            assert!(!compiled(operator).tag_matches(&[]));
+        }
     }
 
     #[test]

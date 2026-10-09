@@ -5,6 +5,9 @@ import {
   tempoAnnotations,
   beatAtMs,
   beatLoopRange,
+  loopBeatsLabel,
+  resizedLoopRange,
+  wrapIntoLoop,
   BEATS_PER_BAR,
   DETAIL_BARS,
   beatsIn,
@@ -30,6 +33,7 @@ import {
   isClick,
   ZOOM_STEPS,
   zoomBy,
+  createWheelZoomGate,
   tempoChangeAtMs,
   phraseKind,
   phraseSpans,
@@ -37,6 +41,9 @@ import {
   memoryTime,
   cuesFor,
   nearestBeatMs,
+  quantizedLaunchMs,
+  foldIntoLoop,
+  callLeavesFrom,
   needsRedraw,
   NO_BEATS,
   scrollOffset,
@@ -872,6 +879,59 @@ describe("beatLoopRange", () => {
   });
 });
 
+describe("resizedLoopRange", () => {
+  const grid = {
+    times: new Uint32Array([1000, 1500, 2000, 2500, 3000]),
+    numbers: new Uint8Array([1, 2, 3, 4, 1]),
+    tempos: new Uint16Array([12_000, 12_000, 12_000, 12_000, 12_000]),
+  };
+  it("halves and doubles a beat loop on the grid, from its own in point", () => {
+    expect(resizedLoopRange(grid, 1000, 3000, 4, 0.5)).toEqual({ range: [1000, 2000], beats: 2 });
+    expect(resizedLoopRange(grid, 1000, 2000, 2, 2)).toEqual({ range: [1000, 3000], beats: 4 });
+  });
+  it("scales a manual loop by its own length and keeps the beat loop length", () => {
+    // Three beats by hand, with the beat loop length at four.
+    expect(resizedLoopRange(grid, 1000, 2500, 4, 0.5)).toEqual({ range: [1000, 1750], beats: 4 });
+  });
+  it("steps a beat loop through rekordbox's 1/64 to 512 beats and stops at the ends", () => {
+    expect(resizedLoopRange(grid, 1000, 1125, 0.25, 0.5)).toEqual({ range: [1000, 1062.5], beats: 0.125 });
+    expect(resizedLoopRange(grid, 1000, 1000 + 500 / 64, 1 / 64, 0.5))
+      .toEqual({ range: [1000, 1000 + 500 / 64], beats: 1 / 64 });
+    expect(resizedLoopRange(grid, 1000, 17_000, 32, 2)).toEqual({ range: [1000, 33_000], beats: 64 });
+    expect(resizedLoopRange(grid, 1000, 257_000, 512, 2)).toEqual({ range: [1000, 257_000], beats: 512 });
+  });
+  it("keeps a manual loop within 1/64 and 512 beats", () => {
+    expect(resizedLoopRange(grid, 1000, 1005, 4, 0.5)).toEqual({ range: [1000, 1000 + 500 / 64], beats: 4 });
+    expect(resizedLoopRange(grid, 1000, 200_000, 4, 2)).toEqual({ range: [1000, 257_000], beats: 4 });
+  });
+  it("has nothing to count on without a grid", () => {
+    expect(resizedLoopRange(NO_BEATS, 1000, 3000, 4, 0.5)).toBeNull();
+  });
+});
+
+describe("wrapIntoLoop", () => {
+  it("leaves a head inside the loop where it is", () => {
+    expect(wrapIntoLoop(1.5, 1, 2)).toBe(1.5);
+    expect(wrapIntoLoop(0.5, 1, 2)).toBe(0.5);
+  });
+  it("takes a head past the end back by whole loops, in time", () => {
+    expect(wrapIntoLoop(2, 1, 2)).toBe(1);
+    expect(wrapIntoLoop(2.25, 1, 2)).toBe(1.25);
+    expect(wrapIntoLoop(4.5, 1, 2)).toBe(1.5);
+  });
+});
+
+describe("loopBeatsLabel", () => {
+  it("writes a fraction of a beat as rekordbox does", () => {
+    expect(loopBeatsLabel(0.25)).toBe("1/4");
+    expect(loopBeatsLabel(0.5)).toBe("1/2");
+    expect(loopBeatsLabel(1)).toBe("1");
+    expect(loopBeatsLabel(32)).toBe("32");
+    expect(loopBeatsLabel(1 / 64)).toBe("1/64");
+    expect(loopBeatsLabel(512)).toBe("512");
+  });
+});
+
 describe("beatAtMs", () => {
   const grid = {
     times: new Uint32Array([1000, 1500, 2000]),
@@ -931,5 +991,131 @@ describe("tempoAnnotations", () => {
     expect(tempoAnnotations(gridOf([17400, 17400, 17400, 17400, 16500, 15000, 12800]))[1])
       .toEqual({ fromMs: 2000, toMs: 3000, fromBpmX100: 17400, toBpmX100: 12800 });
     expect(tempoAnnotations(NO_BEATS)).toEqual([]);
+  });
+});
+
+describe("createWheelZoomGate", () => {
+  it("steps once for a mouse notch", () => {
+    const gate = createWheelZoomGate();
+    expect(gate(100, 0)).toBe(1);
+    expect(gate(-120, 1000)).toBe(-1);
+  });
+
+  it("turns a trackpad swipe and its inertia tail into one or two steps", () => {
+    const gate = createWheelZoomGate();
+    let steps = 0;
+    // 80 events of 8px over 800ms, 16ms apart.
+    for (let i = 0; i < 80; i++) steps += Math.abs(gate(8, i * 10));
+    expect(steps).toBeGreaterThan(0);
+    expect(steps).toBeLessThanOrEqual(6);
+  });
+
+  it("drops partial travel after a pause or a reversal", () => {
+    const gate = createWheelZoomGate();
+    expect(gate(60, 0)).toBe(0);
+    expect(gate(60, 1000)).toBe(0);
+    expect(gate(-60, 1010)).toBe(0);
+    // The old direction's travel was discarded, not netted against.
+    expect(gate(-60, 1020)).toBe(-1);
+  });
+});
+
+describe("quantizedLaunchMs", () => {
+  // 120 BPM: a beat every 500 ms from 1000 ms.
+  const grid = {
+    times: new Uint32Array([1000, 1500, 2000, 2500, 3000]),
+    numbers: new Uint8Array([1, 2, 3, 4, 1]),
+    tempos: new Uint16Array([12_000, 12_000, 12_000, 12_000, 12_000]),
+  };
+
+  it("fires a cue on the grid at the next beat", () => {
+    expect(quantizedLaunchMs(grid, 1700, 1000)).toBe(2000);
+    expect(quantizedLaunchMs(grid, 1501, 2500)).toBe(2000);
+  });
+
+  it("fires at once when the playhead is on a beat", () => {
+    expect(quantizedLaunchMs(grid, 2000, 1000)).toBe(2000);
+  });
+
+  it("keeps an off-grid cue's place within the beat", () => {
+    // The cue sits 100 ms past a beat, so the jump waits for the next point
+    // 100 ms past a beat: the bar runs on unbroken.
+    expect(quantizedLaunchMs(grid, 1700, 2600)).toBe(2100);
+    expect(quantizedLaunchMs(grid, 1550, 2600)).toBe(1600);
+  });
+
+  it("follows the quantize beat value through a finer grid", () => {
+    const halves = subdivideGrid(grid, 2);
+    expect(quantizedLaunchMs(halves, 1600, 1000)).toBe(1750);
+  });
+
+  it("carries the edge spacing past the ends of the grid", () => {
+    expect(quantizedLaunchMs(grid, 3100, 1000)).toBe(3500);
+    expect(quantizedLaunchMs(grid, 200, 1000)).toBe(500);
+  });
+
+  it("has nothing to time against without two beats", () => {
+    const one = { times: new Uint32Array([1000]), numbers: new Uint8Array([1]), tempos: new Uint16Array([12_000]) };
+    expect(quantizedLaunchMs(one, 1200, 1000)).toBeNull();
+  });
+});
+
+describe("quantizedLaunchMs inside a playing loop", () => {
+  // rekordbox 7.2.19: moveToCueAndPlayWithWait fires at min(out, max(step,
+  // head)) when doHotCueLaunch left a loop [OBS static, parity/issue-126].
+  const grid = {
+    times: new Uint32Array([1000, 1500, 2000, 2500, 3000]),
+    numbers: new Uint8Array([1, 2, 3, 4, 1]),
+    tempos: new Uint16Array([12_000, 12_000, 12_000, 12_000, 12_000]),
+  };
+
+  it("fires at the out point of a one-beat loop, where the head would wrap", () => {
+    expect(quantizedLaunchMs(grid, 1200, 500, 1500)).toBe(1500);
+  });
+
+  it("never fires past the out point for an off-grid cue", () => {
+    // The step at the cue's phase is 1600, past the loop's end at 1500.
+    expect(quantizedLaunchMs(grid, 1200, 2600, 1500)).toBe(1500);
+  });
+
+  it("fires at the next step when that comes before the out point", () => {
+    expect(quantizedLaunchMs(grid, 1200, 500, 3000)).toBe(1500);
+  });
+});
+
+describe("foldIntoLoop", () => {
+  const loop = { inSeconds: 1, outSeconds: 1.5 };
+
+  it("leaves a head inside the loop where it is", () => {
+    expect(foldIntoLoop(1.2, loop)).toBe(1.2);
+  });
+
+  it("brings a head read past the out point back by whole loops", () => {
+    expect(foldIntoLoop(1.6, loop)).toBeCloseTo(1.1);
+    expect(foldIntoLoop(2.1, loop)).toBeCloseTo(1.1);
+  });
+});
+
+describe("callLeavesFrom", () => {
+  it("jumps from the launch point when the timer is a little late", () => {
+    expect(callLeavesFrom(1.52, 1.5, 0, 0.15)).toBe(1.5);
+  });
+
+  it("drops the call when something else moved the head", () => {
+    expect(callLeavesFrom(3, 1.5, 0, 0.15)).toBeNull();
+  });
+
+  it("takes a reading run on past a one-beat loop's out point as the launch point", () => {
+    // Read from a tick before the engine wrapped: a loop or two ahead.
+    expect(callLeavesFrom(1.99, 1.5, 0.5, 0.15)).toBe(1.5);
+    expect(callLeavesFrom(2.51, 1.5, 0.5, 0.15)).toBe(1.5);
+  });
+
+  it("jumps from a loop back when the engine wrapped before the exit reached it", () => {
+    expect(callLeavesFrom(1.01, 1.5, 0.5, 0.15)).toBe(1);
+  });
+
+  it("still drops a call the head moved away from inside a loop", () => {
+    expect(callLeavesFrom(1.75, 1.5, 0.5, 0.15)).toBeNull();
   });
 });

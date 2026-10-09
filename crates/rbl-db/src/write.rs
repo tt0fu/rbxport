@@ -286,6 +286,28 @@ pub struct PlaylistDeletion {
     pub membership_ids: Vec<String>,
 }
 
+/// What [`Writer::import_folder_as_playlist`] did with one folder.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FolderPlaylist {
+    /// The playlist made; `None` when nothing was written, either because the
+    /// folder held no audio or because of [`Self::conflict`].
+    pub playlist: Option<String>,
+    /// A sibling with the folder's name, to be replaced only once the user
+    /// agrees. Nothing is written while this is set.
+    pub conflict: Option<String>,
+    /// Tracks added to the library, with the file each came from.
+    pub imported: Vec<(String, PathBuf)>,
+    /// Tracks the library already held, now in the playlist too.
+    pub existing: Vec<String>,
+    /// Files that could not be imported, each with the reason.
+    pub skipped: Vec<String>,
+    /// The place under the target the playlist was put, or would have been:
+    /// the insert index rekordbox keeps for every folder of one drop. Pass it
+    /// back as `at` for the drop's next folder. `None` when the folder held
+    /// no audio, so nothing was looked at.
+    pub at: Option<usize>,
+}
+
 /// One playlist or folder move, with both positions counted among the
 /// destination parent's live children.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -599,6 +621,17 @@ impl Writer {
         self.move_to(&edit.id, &edit.after_parent, Some(edit.after_index))
     }
 
+    /// The live children of `parent`, in tree order.
+    fn child_ids(&self, parent: &str) -> Result<Vec<String>> {
+        let mut statement = self.library.connection().prepare(
+            "SELECT ID FROM djmdPlaylist WHERE ParentID = ?1 AND rb_local_deleted = 0 ORDER BY Seq, ID",
+        )?;
+        let ids = statement
+            .query_map(params![parent], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ids)
+    }
+
     fn playlist_position(&self, id: &str) -> Result<(String, usize)> {
         let conn = self.library.connection();
         let parent = conn.query_row(
@@ -828,6 +861,188 @@ impl Writer {
         if rows > 0 {
             set_counter(&tx, usn)?;
         }
+        tx.commit()?;
+        Ok(Changed { rows, usn })
+    }
+
+    /// The live playlist, folder or intelligent playlist under `parent` named
+    /// exactly `name`, if there is one.
+    pub fn child_named(&self, parent: &str, name: &str) -> Result<Option<String>> {
+        Ok(self.library.connection().query_row(
+            "SELECT ID FROM djmdPlaylist
+             WHERE ParentID = ?1 AND Name = ?2 AND rb_local_deleted = 0
+             ORDER BY Seq, ID LIMIT 1",
+            params![parent, name],
+            |r| r.get::<_, String>(0),
+        ).optional()?)
+    }
+
+    /// A folder from disk dropped onto the playlist tree: one playlist named
+    /// after it, holding every audio file found under it.
+    ///
+    /// What rekordbox 7.2.19 does for a folder dropped onto the Playlists root
+    /// or a playlist folder (`TreeViewer::treeMessageImportExternalFoldersToList`)
+    /// [OBS, static]: nothing at all when the folder holds no file it plays;
+    /// otherwise a playlist under the drop target named after the folder, its
+    /// subfolders flattened into it rather than made into playlists of their
+    /// own, with new files imported and files already in the library reused.
+    ///
+    /// `files` is the folder's contents in the order they belong in the
+    /// playlist (see [`crate::import::audio_files_in`]).
+    ///
+    /// A sibling with the same name is the one question rekordbox asks
+    /// ("One or several lists with the same name already exist. Do you want
+    /// to replace them with the one you're importing?",
+    /// `TreeViewer::showReplaceListAlert`). Nothing is written until it is
+    /// answered: the clash comes back in [`FolderPlaylist::conflict`], and the
+    /// caller calls again with `replace` set to that id to replace it.
+    ///
+    /// `at` is where the playlist goes among `parent`'s children; `None`
+    /// means the end, as for a drop onto the middle of a folder row. Every
+    /// folder of one drop goes to the same index, so pass each call the
+    /// [`FolderPlaylist::at`] the previous one returned. rekordbox does the
+    /// same [OBS rekordbox 7.2.19 static]: `treeMessageImportExternalFoldersToList`
+    /// (0x1015677ec) reads the drop's insert index once and passes it to
+    /// `createTargetList` for every folder; `rekordboxDBController::createNewList`
+    /// (0x1017e6808) appends with `insertPlaylist` (seq one past
+    /// `getPlaylistFolderSeqMax`) and then `movePlaylist`s the new list to that
+    /// index whenever its seq is not below it. So a later folder lands before an earlier one: two
+    /// folders `A`, `B` end up `B`, `A`. Replacing a clash that sat before the
+    /// index takes one off it (`checkSameNameList` 0x10155d5a8, @0x10155d748..0x10155d75c),
+    /// and that lower index holds for the rest of the drop.
+    pub fn import_folder_as_playlist(
+        &mut self,
+        name: &str,
+        parent: &str,
+        files: &[PathBuf],
+        replace: Option<&str>,
+        at: Option<usize>,
+    ) -> Result<FolderPlaylist> {
+        let mut outcome = FolderPlaylist::default();
+        if files.is_empty() {
+            outcome.at = at;
+            return Ok(outcome);
+        }
+        let mut at = match at {
+            Some(at) => at,
+            None => self.child_ids(parent)?.len(),
+        };
+        if let Some(clash) = self.child_named(parent, name)? {
+            if replace != Some(clash.as_str()) {
+                outcome.conflict = Some(clash);
+                outcome.at = Some(at);
+                return Ok(outcome);
+            }
+            let (_, place) = self.playlist_position(&clash)?;
+            self.delete_playlist(&clash)?;
+            if place < at {
+                at -= 1;
+            }
+        }
+        outcome.at = Some(at);
+        let playlist = self.create_playlist(name, parent)?;
+        if self.child_ids(parent)?.iter().position(|id| *id == playlist) != Some(at) {
+            self.move_to(&playlist, parent, Some(at))?;
+        }
+        let mut members = Vec::with_capacity(files.len());
+        for file in files {
+            if let Some(id) = self.track_id_at(file)? {
+                outcome.existing.push(id.clone());
+                members.push(id);
+                continue;
+            }
+            match self.import_file(file) {
+                Ok(id) => {
+                    outcome.imported.push((id.clone(), file.clone()));
+                    members.push(id);
+                }
+                Err(DbError::WriteRefused(reason)) => {
+                    outcome.skipped.push(format!("{}: {reason}", file.display()));
+                }
+                Err(other) => return Err(other),
+            }
+        }
+        if !members.is_empty() {
+            self.add_tracks(&playlist, &members)?;
+        }
+        outcome.playlist = Some(playlist);
+        Ok(outcome)
+    }
+
+    /// Makes a playlist hold exactly `contents`, in that order, the first of a
+    /// repeated track counting: the current members are soft-deleted and the
+    /// new ones written with `TrackNo` 1..N, all in one transaction, so a
+    /// refusal or error partway leaves the old members and order as they were.
+    /// Writes nothing when the playlist already holds exactly these. Refuses an
+    /// intelligent playlist, a folder, and a track not in the library.
+    /// `rows` is the membership rows written for the new members.
+    pub fn set_tracks(&mut self, playlist: &str, contents: &[String]) -> Result<Changed> {
+        let mut seen = std::collections::HashSet::new();
+        let wanted: Vec<&String> = contents.iter().filter(|c| seen.insert(c.as_str())).collect();
+        self.prepare()?;
+        let stamp = time::now();
+        let mut ids: Vec<(String, String)> = Vec::with_capacity(wanted.len());
+        for _ in &wanted {
+            ids.push((self.rng.uuid4(), self.rng.uuid4()));
+        }
+
+        let tx = self.library.connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let attribute: Option<i64> = tx
+            .query_row(
+                "SELECT Attribute FROM djmdPlaylist WHERE ID = ?1 AND rb_local_deleted = 0",
+                params![playlist],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match attribute {
+            None => return Err(DbError::WriteRefused(format!("no playlist {playlist}"))),
+            Some(ATTRIBUTE_FOLDER) => {
+                return Err(DbError::WriteRefused(format!("{playlist} is a folder, not a playlist")))
+            }
+            Some(_) => refuse_if_smart(&tx, playlist)?,
+        }
+        let current: Vec<(String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT ID, ContentID FROM djmdSongPlaylist
+                 WHERE PlaylistID = ?1 AND rb_local_deleted = 0 ORDER BY TrackNo, ID",
+            )?;
+            let rows = stmt.query_map(params![playlist], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        if current.len() == wanted.len()
+            && current.iter().zip(&wanted).all(|((_, have), want)| have == *want)
+        {
+            return Ok(Changed { rows: 0, usn: 0 });
+        }
+
+        let mut usn = 0;
+        for (row_id, _) in &current {
+            usn = next_usn(&tx)?;
+            tx.execute(
+                "UPDATE djmdSongPlaylist SET rb_local_deleted = 1, rb_local_usn = ?1,
+                    updated_at = ?2 WHERE ID = ?3",
+                params![usn, stamp, row_id],
+            )?;
+        }
+        let mut rows = 0;
+        for ((track_no, content), (row_id, uuid)) in (1_i64..).zip(&wanted).zip(ids) {
+            // Checked here, after the old rows are gone, so a refusal is the
+            // transaction rolling back, never a half-replaced playlist.
+            if !content_exists(&tx, content)? {
+                return Err(DbError::WriteRefused(format!("no track {content}")));
+            }
+            usn = next_usn(&tx)?;
+            rows += tx.execute(
+                "INSERT INTO djmdSongPlaylist
+                    (ID, PlaylistID, ContentID, TrackNo, UUID,
+                     rb_data_status, rb_local_data_status, rb_local_deleted, rb_local_synced,
+                     usn, rb_local_usn, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, 0, 0, NULL, ?6, ?7, ?7)",
+                params![row_id, playlist, content, track_no, uuid, usn, stamp],
+            )?;
+        }
+        set_counter(&tx, usn)?;
         tx.commit()?;
         Ok(Changed { rows, usn })
     }
@@ -1074,6 +1289,28 @@ impl Writer {
 
     // ---------------------------------------------------------------- import
 
+    /// The id of the live track already imported from `path`, if any.
+    ///
+    /// Read-only. It lets a caller that was handed a file that is already in
+    /// the library (a drop onto a playlist) use the existing row rather than
+    /// treat the file as unimportable. The path is cleaned the same way
+    /// [`Self::import_file`] cleans it, so the two agree on what "already
+    /// there" means.
+    pub fn track_id_at(&self, path: &Path) -> Result<Option<String>> {
+        let path = normalized(path);
+        let folder = path.to_string_lossy().into_owned();
+        let id = self
+            .library
+            .connection()
+            .query_row(
+                "SELECT ID FROM djmdContent WHERE FolderPath = ?1 AND rb_local_deleted = 0 ORDER BY ID LIMIT 1",
+                params![folder],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(id)
+    }
+
     /// Adds a file to the library, returning the new track's id.
     ///
     /// The row shape is the one the reference library shows for a track made
@@ -1133,6 +1370,7 @@ impl Writer {
         let album = intern(&tx, "djmdAlbum", "Name", &tags.album, &mut self.rng, &stamp)?;
         let genre = intern(&tx, "djmdGenre", "Name", &tags.genre, &mut self.rng, &stamp)?;
         let label = intern(&tx, "djmdLabel", "Name", &tags.label, &mut self.rng, &stamp)?;
+        let key = tag_key_id(&tx, &tags.key, &mut self.rng, &stamp)?;
 
         let usn = next_usn(&tx)?;
         // Every column rekordbox 7 fills on a file it imports itself, as on
@@ -1143,7 +1381,7 @@ impl Writer {
         // `*Updated` counters, which rekordbox sets as it goes.
         tx.execute(
             "INSERT INTO djmdContent
-                (ID, FolderPath, FileNameL, FileNameS, Title, Subtitle, ArtistID, AlbumID, GenreID, LabelID,
+                (ID, FolderPath, FileNameL, FileNameS, Title, Subtitle, ArtistID, AlbumID, GenreID, LabelID, KeyID,
                  Length, BitRate, BitDepth, SampleRate, FileSize, FileType, ReleaseYear, TrackNo, DiscNo,
                  Commnt, Rating, ColorID, DJPlayCount, Analysed, UUID,
                  StockDate, DateCreated, MasterDBID, MasterSongID, DeviceID, HotCueAutoLoad,
@@ -1151,7 +1389,7 @@ impl Writer {
                  SamplerTrackInfo, SamplerPlayOffset, SamplerGain, VideoAssociate, LyricStatus, ServiceID,
                  rb_data_status, rb_local_data_status, rb_local_deleted, rb_local_synced,
                  usn, rb_local_usn, created_at, updated_at)
-             VALUES (?1, ?2, ?3, '', ?4, '', ?5, ?6, ?7, ?8,
+             VALUES (?1, ?2, ?3, '', ?4, '', ?5, ?6, ?7, ?8, ?24,
                      ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 0,
                      ?17, 0, 0, 0, NULL, ?18,
                      ?19, ?19, ?20, ?1, ?21, 'on',
@@ -1182,7 +1420,8 @@ impl Writer {
                 master_db,
                 device,
                 usn,
-                stamp
+                stamp,
+                key
             ],
         )?;
         set_counter(&tx, usn)?;
@@ -1655,6 +1894,12 @@ impl Writer {
         self.track_edit(content, column, |writer| writer.set_field(content, field, value))
     }
 
+    /// Whether `content` is a track in the library: a row that is there and
+    /// not soft-deleted.
+    pub fn has_track(&self, content: &str) -> Result<bool> {
+        content_exists(self.library.connection(), content)
+    }
+
     pub fn undo_track_edit(&mut self, edit: &TrackEdit) -> Result<Changed> {
         self.touch_content(&edit.content, edit.column, &edit.before)
     }
@@ -2047,6 +2292,7 @@ impl Writer {
         if image.is_some_and(|p| !p.is_empty()) {
             return Ok(false);
         }
+        let path = self.real_path(&path);
         let Some(bytes) = crate::import::read_artwork(Path::new(&path))
             .map_err(|e| DbError::WriteRefused(e.to_string()))? else {
             return Ok(false);
@@ -2093,26 +2339,23 @@ impl Writer {
     }
 
     /// Reload Tag: reads the file's tags again and writes what they say
-    /// over the row — title, artist, album, genre, label, comment, year and
-    /// track number [ASSUME: which fields rekordbox's Reload Tag takes has
-    /// not been captured; these are the ones its import reads]. Fields the
-    /// file leaves empty are left as they are. Returns how many changed.
+    /// over the row — title, artist, album, genre, label, comment, key, year
+    /// and track number, each from the tag rekordbox reads it from (see
+    /// [`crate::import::read_tags`]). rekordbox's Reload Tag
+    /// (`DatabaseMediator::readTag` @0x100c459ec, 7.2.19 macOS arm64) and its
+    /// import share `convertTagData` @0x100c463e0, which takes the key only
+    /// when the tag has one and never reads the BPM [OBS static]. Fields the
+    /// file leaves empty are left as they are [ASSUME: `convertTagData`
+    /// copies the text fields even when empty; what rekordbox then shows for
+    /// one has not been observed]. Returns how many changed.
     pub fn reload_tags(&mut self, content: &str) -> Result<usize> {
         self.prepare()?;
-        let folder: Option<String> = self
-            .library
-            .connection()
-            .query_row(
-                "SELECT FolderPath FROM djmdContent WHERE ID = ?1 AND rb_local_deleted = 0",
-                params![content],
-                |r| r.get(0),
-            )
-            .optional()?
-            .flatten();
-        let Some(folder) = folder else {
+        let Some(stored) = self.library.stored_path(content)? else {
             return Err(DbError::WriteRefused(format!("no track {content}")));
         };
-        let path = crate::resolve_folder_path(&folder, None);
+        // The file rekordbox opens: a cloud-synced track's local copy, as
+        // playback resolves it, not the raw stored path.
+        let path = self.library.track_paths().resolve(&stored);
         let tags = crate::import::read_tags(Path::new(&path))
             .map_err(|e| DbError::WriteRefused(e.to_string()))?;
         let stamp = time::now();
@@ -2127,6 +2370,9 @@ impl Writer {
                 let id = intern(&tx, table, "Name", value.trim(), &mut self.rng, &stamp)?;
                 fields.push((column, id.map_or(Value::Null, Value::Text)));
             }
+        }
+        if let Some(key) = tag_key_id(&tx, &tags.key, &mut self.rng, &stamp)? {
+            fields.push(("KeyID", Value::Text(key)));
         }
         if tags.year != 0 { fields.push(("ReleaseYear", Value::Integer(i64::from(tags.year)))); }
         if tags.track_no != 0 { fields.push(("TrackNo", Value::Integer(i64::from(tags.track_no)))); }
@@ -2262,6 +2508,12 @@ impl Writer {
             )));
         };
         self.touch_content(content, "KeyID", &Value::Text(id))
+    }
+
+    /// A stored `FolderPath` as rekordbox reads it. See
+    /// [`crate::Library::real_folder_path`].
+    fn real_path(&self, folder_path: &str) -> String {
+        self.library.real_folder_path(folder_path)
     }
 
     /// Points a track at a different file.
@@ -2652,6 +2904,36 @@ fn normalized(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// The `djmdKey` row for a key a file's tag names, made when the library has
+/// none of that name; `None` for no key.
+///
+/// rekordbox does make one for a tag's key: on the reference library a `2A`
+/// row was created 4 ms before the imported track that points at it [OBS].
+/// Its `Seq` rule is unknown, so the row is made the way
+/// [`Writer::ensure_detected_key`] makes one for an analysed key, without a
+/// `Seq`. An existing name resolves as an analysis does, by [`key_id_for`].
+/// The name is matched as the tag wrote it [UNKNOWN: whether rekordbox
+/// normalises it, say trims spaces, when it looks the row up].
+fn tag_key_id(conn: &Connection, name: &str, rng: &mut Rng, stamp: &str) -> Result<Option<String>> {
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT k.ID FROM djmdKey k
+             LEFT JOIN djmdContent c ON c.KeyID = k.ID AND c.rb_local_deleted = 0
+             WHERE k.ScaleName = ?1 AND k.rb_local_deleted = 0
+             GROUP BY k.ID ORDER BY COUNT(c.ID) DESC, k.ID LIMIT 1",
+            params![name],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match existing {
+        Some(id) => Ok(Some(id)),
+        None => intern(conn, "djmdKey", "ScaleName", name, rng, stamp),
+    }
 }
 
 /// The `djmdKey` row for a key name: where two rows share a name, the one

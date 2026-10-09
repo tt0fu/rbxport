@@ -41,7 +41,7 @@ import styles from "./SubBrowser.module.css";
 /** What the sub-browser's tree does that the shell has to do for it. */
 export type SubTreeProps = Pick<
   TreeViewProps,
-  "dragging" | "onDropTracks" | "onExport" | "onExportFile" | "onCreatePlaylist" | "onCreateFolder"
+  "dragging" | "onDropTracks" | "onExport" | "exportDevices" | "onExportFile" | "onCreatePlaylist" | "onCreateFolder"
   | "onDeleteNode" | "onRenameNode" | "onMoveNode" | "onDropFiles" | "onExpand" | "showCounts"
   | "onOpenSync" | "onCreateSmartPlaylist" | "onEditSmartPlaylist" | "onAddArtwork"
   | "onAddToShortcut" | "onSortItems" | "onEjectDevice" | "ejectingDeviceId" | "deviceBusy"
@@ -54,12 +54,14 @@ export type SubListProps = Pick<
   "onDragTracks" | "onDragError" | "players" | "onLoadTrack" | "onShowInformation" | "onShowInFinder"
   | "onRate" | "onComment" | "pendingEdits" | "readOnly" | "dragging" | "onDropTracks"
   | "onResetPlayCount" | "onConvertMemoryCues" | "onRemoveFromCollection" | "onImportToCollection"
+  | "onAutoRelocate" | "onRelocate"
   | "onAnalysisLock" | "onAddToPlaylist" | "onAddToTagList" | "onRemoveFromTagList" | "onReloadTag"
   | "onExportTrack" | "playlists" | "devices" | "onEditField" | "onEditBlocked" | "onFocusedRow"
-  | "onSelectedRow"
+  | "onSelectedRow" | "onSelectedTracks"
 > & {
-  onRemoveTracksFromPlaylist: (playlistId: string, ids: readonly string[]) => void;
-  onRemoveTracksFromHistory: (historyId: string, ids: readonly string[]) => void;
+  /** Resolves true once removed; false when declined or refused. */
+  onRemoveTracksFromPlaylist: (playlistId: string, ids: readonly string[]) => Promise<boolean>;
+  onRemoveTracksFromHistory: (historyId: string, ids: readonly string[]) => Promise<boolean>;
   onReorderPlaylist: (playlistId: string, order: readonly string[]) => void;
   onDropFilesIntoPlaylist: (playlistId: string, files: File[]) => void;
   onAnalyseTracks: (tracks: readonly { id: string; title: string }[]) => void;
@@ -185,6 +187,13 @@ export const SubBrowser = memo(function SubBrowser({
   const [searchField, setSearchField] = useState<TrackSearchField>("all");
   const [sort, setSort] = useState<SortState | null>(null);
   const [selectedTracks, setSelectedTracks] = useState<{ id: string; title: string }[]>([]);
+  // Kept here for its own Analyze Track, and told to the shell, whose
+  // information panel follows whichever list was selected in last.
+  const reportSelection = list.onSelectedTracks;
+  const onSelectedTracks = useCallback((tracks: { id: string; title: string }[]) => {
+    setSelectedTracks(tracks);
+    reportSelection?.(tracks);
+  }, [reportSelection]);
   // Its own columns too: a sub-browser is usually kept narrow, and forcing it
   // to share the main table's widths would make it useless.
   const cols = useColumns("subBrowser");
@@ -199,15 +208,13 @@ export const SubBrowser = memo(function SubBrowser({
     setSort((current) => nextSort(current ?? DEFAULT_SORT, column));
   }, []);
   const removeFromPlaylist = useCallback(
-    (ids: readonly string[]) => {
-      if (spec.source.kind === "playlist") list.onRemoveTracksFromPlaylist(spec.source.id, ids);
-    },
+    (ids: readonly string[]): Promise<boolean> =>
+      spec.source.kind === "playlist" ? list.onRemoveTracksFromPlaylist(spec.source.id, ids) : Promise.resolve(false),
     [list, spec.source],
   );
   const removeFromHistory = useCallback(
-    (ids: readonly string[]) => {
-      if (spec.source.kind === "history") list.onRemoveTracksFromHistory(spec.source.id, ids);
-    },
+    (ids: readonly string[]): Promise<boolean> =>
+      spec.source.kind === "history" ? list.onRemoveTracksFromHistory(spec.source.id, ids) : Promise.resolve(false),
     [list, spec.source],
   );
   const reorderPlaylist = useCallback(
@@ -300,7 +307,7 @@ export const SubBrowser = memo(function SubBrowser({
             ? reorderPlaylist
             : undefined
         }
-        onSelectedTracks={setSelectedTracks}
+        onSelectedTracks={onSelectedTracks}
         onAnalyse={analyseSelection}
       />
     </section>

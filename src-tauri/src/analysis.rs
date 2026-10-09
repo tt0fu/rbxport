@@ -20,30 +20,42 @@ use crate::commands::{blocking, write_error};
 use crate::error::{AppError, AppResult, ErrorKind};
 use crate::state::AppState;
 
-/// How much of a file is decoded, in seconds.
+/// How much of a file is held in memory for analysis, in seconds.
 ///
-/// Tempo and key are global properties and three minutes settle them, but
-/// the grid and the waveforms have to reach the end of the track — a CDJ
-/// draws nothing past where they stop. Thirty minutes covers every track
-/// and stops a two-hour mix from becoming a gigabyte of samples; a mix
-/// longer than that is analysed up to the cap and drawn that far.
+/// Tempo and key are global properties and three minutes settle them, so
+/// thirty minutes is plenty for both and stops a two-hour mix from becoming
+/// a gigabyte of samples. The grid and the waveforms still have to reach
+/// the end of the track, as rekordbox's do — a CDJ draws nothing past where
+/// they stop — so the rest of a longer file is decoded too, but streamed:
+/// folded into the waveform as it goes, with the grid carried on at the
+/// last tempo (see [`analyse_file`]).
 const DECODE_CAP_SECS: f64 = 1800.0;
+
+/// How near an existing memory cue has to be to the first beat to count as
+/// one already there. Re-analysing with the same settings places the first
+/// beat on the same millisecond, so this only absorbs rounding; a beat that
+/// moved further is a new place and gets its own cue.
+const FIRST_BEAT_CUE_TOLERANCE_MS: u32 = 5;
 
 /// Per-batch choices from the Analysis Setting dialog. Missing settings
 /// preserve the defaults used by imports and older callers.
 #[derive(Debug, Clone, Copy, serde::Deserialize)]
 #[serde(default, rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools, reason = "the dialog's independent checkboxes, sent together")]
 pub struct AnalysisSettings {
     pub bpm_grid: bool,
     pub key: bool,
     pub high_precision: bool,
     pub min_bpm: f64,
     pub max_bpm: f64,
+    /// Add a memory cue on the first beat of the new grid, unless one is
+    /// already there. Only a BPM / Grid pass has a grid to place it on.
+    pub first_beat_cue: bool,
 }
 
 impl Default for AnalysisSettings {
     fn default() -> Self {
-        Self { bpm_grid: true, key: true, high_precision: true, min_bpm: 70.0, max_bpm: 180.0 }
+        Self { bpm_grid: true, key: true, high_precision: true, min_bpm: 70.0, max_bpm: 180.0, first_beat_cue: false }
     }
 }
 
@@ -84,6 +96,10 @@ pub struct AnalysisResultDto {
     pub elapsed_ms: u64,
     /// Where the analysis files went, share-relative.
     pub analysis_path: String,
+    /// Whether this pass added a memory cue on the first beat, so the
+    /// command can tell decks showing the track to refetch its cues.
+    #[serde(skip)]
+    pub added_first_beat_cue: bool,
 }
 
 /// Analyses one track and keeps the result: the files in the share tree,
@@ -118,6 +134,9 @@ pub async fn analyse_track<R: tauri::Runtime>(
     // The track's id, well inside the 1 KB event cap: a deck showing the
     // track redraws its waveform and grid from the new files.
     let _ = tauri::Emitter::emit(&app, "analysis:changed", &result.track_id);
+    if result.added_first_beat_cue {
+        let _ = tauri::Emitter::emit(&app, "cues:changed", &result.track_id);
+    }
     Ok(result)
 }
 
@@ -154,14 +173,11 @@ fn analyse_and_save(
     }
 
     let started = std::time::Instant::now();
-    let audio = rbl_audio::decode_mono(std::path::Path::new(path), Some(DECODE_CAP_SECS)).map_err(|e| {
-        AppError::new(ErrorKind::Malformed, "That file could not be decoded.")
-            .with_detail(e.to_string())
-    })?;
     if !settings.bpm_grid {
+        let audio = rbl_audio::decode_mono(std::path::Path::new(path), Some(DECODE_CAP_SECS)).map_err(|e| decode_error(&e))?;
         return analyse_key_only(state, library, row, track_id, &audio, editor, started);
     }
-    let analysis = rbl_analysis::analyse_with(&audio.samples, audio.sample_rate, options);
+    let (analysis, duration_secs) = analyse_file(std::path::Path::new(path), &options, DECODE_CAP_SECS)?;
 
     let _edit_guard = state.edit_gate.lock();
     ensure_analysis_unlocked(state, editor, track_id)?;
@@ -210,12 +226,15 @@ fn analyse_and_save(
     let bpm_x100 = to_u32(analysis.tempo.bpm * 100.0);
     let detected_key = settings.key.then(|| analysis.key.map(|k| k.name)).flatten();
     let key = detected_key.clone().unwrap_or_else(|| library.keys.name(library.key.get(row).copied().unwrap_or(0)).to_owned());
-    let duration_sec = to_u32(audio.duration_secs());
-    // The length is kept only when the whole file was decoded: a capped
-    // decode's length would be the cap, not the track's.
-    let length_sec = (audio.duration_secs() < DECODE_CAP_SECS - 1.0).then_some(duration_sec);
+    let duration_sec = to_u32(duration_secs);
+    // The whole file was decoded, however long, so this is its length.
+    let length_sec = Some(duration_sec);
 
     save_analysis_files(state, &location, track_id, &dat, files, bpm_x100, detected_key.as_deref(), &relative, length_sec, editor)?;
+    let added_first_beat_cue = match beats.first() {
+        Some(first) if settings.first_beat_cue => add_first_beat_cue(state, library, track_id, first.time_ms)?,
+        _ => false,
+    };
 
     Ok(AnalysisResultDto {
         track_id: track_id.to_owned(),
@@ -227,7 +246,101 @@ fn analyse_and_save(
         duration_sec,
         elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         analysis_path: relative,
+        added_first_beat_cue,
     })
+}
+
+fn decode_error(e: &rbl_audio::AudioError) -> AppError {
+    AppError::new(ErrorKind::Malformed, "That file could not be decoded.").with_detail(e.to_string())
+}
+
+/// Decodes and analyses a whole file, holding at most `head_secs` of it.
+///
+/// The tempo, key and level come from the first `head_secs`. A file longer
+/// than that is decoded on to its end without being kept: its waveform is
+/// built from every sample, start to finish, and the grid is carried on at
+/// the head's last tempo, so both reach the end of the track the way
+/// rekordbox's do [OBS: a 40.8-minute rekordbox export has `PWV5`/`PWV7`
+/// for all 2,447.9 s and its last beat at 2,447.5 s]. Before this the
+/// waveform and grid stopped at the half hour (#156).
+///
+/// Resolves to the analysis and the file's length in seconds.
+fn analyse_file(
+    path: &std::path::Path,
+    options: &rbl_analysis::AnalysisOptions,
+    head_secs: f64,
+) -> AppResult<(rbl_analysis::Analysis, f64)> {
+    let mut stream = rbl_audio::MonoStream::open(path).map_err(|e| decode_error(&e))?;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a positive number of seconds at an audio rate")]
+    let cap = (head_secs.max(0.0) * f64::from(stream.sample_rate())) as usize;
+    let mut head: Vec<f32> = Vec::with_capacity(cap.min(1 << 24));
+    // Past the head, the whole file's waveform, which begins with the head.
+    let mut rest: Option<rbl_analysis::waveform::Builder> = None;
+    while let Some(chunk) = stream.next_chunk() {
+        if let Some(builder) = rest.as_mut() {
+            builder.push(chunk);
+            continue;
+        }
+        head.extend_from_slice(chunk);
+        if head.len() > cap {
+            let mut builder = rbl_analysis::waveform::Builder::new(stream.sample_rate());
+            builder.push(&head);
+            head.truncate(cap);
+            head.shrink_to_fit();
+            rest = Some(builder);
+        }
+    }
+    if head.is_empty() {
+        return Err(decode_error(&rbl_audio::AudioError::Unsupported("decoded no samples".into())));
+    }
+    let rate = stream.sample_rate();
+    let audio = rbl_audio::Audio { samples: head, sample_rate: rate, source_channels: stream.source_channels() };
+    let mut analysis = rbl_analysis::analyse_with(&audio.samples, rate, *options);
+    let Some(builder) = rest else {
+        return Ok((analysis, audio.duration_secs()));
+    };
+    #[allow(clippy::cast_precision_loss, reason = "a sample count well inside f64's exact range")]
+    let duration_secs = builder.samples() as f64 / f64::from(rate.max(1));
+    analysis.peak = analysis.peak.max(builder.peak());
+    analysis.tempo.extend_to(duration_secs);
+    analysis.waveform = builder.finish();
+    Ok((analysis, duration_secs))
+}
+
+/// Adds a memory cue at `first_beat_ms` unless a memory cue is already
+/// there, and re-reads the track's cues into the index. Resolves to whether
+/// a cue was added.
+///
+/// Runs after the analysis is published, so a refusal here leaves the new
+/// grid in place; the error says the analysis was saved and only the cue
+/// is missing.
+fn add_first_beat_cue(
+    state: &AppState,
+    library: &rbl_index::Library,
+    track_id: &str,
+    first_beat_ms: u32,
+) -> AppResult<bool> {
+    // The index is current: every cue edit re-reads its track's cues.
+    let Some(row) = library.row_of(track_id) else { return Ok(false) };
+    if !needs_first_beat_cue(&library.cues_of(row), first_beat_ms) {
+        return Ok(false);
+    }
+    state
+        .write_then(
+            |writer| writer.add_cue(track_id, rbl_index::Cue::MEMORY, first_beat_ms),
+            |db, _cue| rbl_index::reload_cues_of(db, library, track_id).map_err(rbl_db::DbError::from),
+        )
+        .map_err(|e| {
+            let cause = write_error(e);
+            AppError::new(cause.kind, "The analysis was saved, but the first-beat memory cue could not be added.")
+                .with_detail(cause.message)
+        })?;
+    Ok(true)
+}
+
+/// Whether no memory cue (or memory loop) already starts on the first beat.
+fn needs_first_beat_cue(cues: &[rbl_index::Cue], first_beat_ms: u32) -> bool {
+    !cues.iter().any(|cue| cue.is_memory() && cue.position_ms.abs_diff(first_beat_ms) <= FIRST_BEAT_CUE_TOLERANCE_MS)
 }
 
 /// Journals, publishes and registers a fresh analysis — the on-disk half of
@@ -314,6 +427,7 @@ fn analyse_key_only(state: &AppState, library: &rbl_index::Library, row: usize, 
         duration_sec: library.length_sec.get(row).copied().unwrap_or(0),
         elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         analysis_path: library.analysis_path.get(row).to_owned(),
+        added_first_beat_cue: false,
     })
 }
 
@@ -550,10 +664,97 @@ mod tests {
         let key_after: Option<String> = db.connection().query_row("SELECT KeyID FROM djmdContent WHERE ID = ?1", [track_id(0)], |r| r.get(0)).unwrap();
         assert_eq!(key_after, key_before);
 
+        // No cue unless asked for: the passes above left the track's cues alone.
+        let cues = |library: &rbl_index::Library| library.cues_of(library.row_of(&track_id(0)).unwrap());
+        assert!(cues(&fresh).iter().all(|cue| !cue.is_memory()));
+
+        // Asked for, a memory cue lands on the grid's first beat, once: a
+        // second pass finds it there and adds nothing.
+        let first_beat = rbl_anlz::Anlz::read(&dat_path).unwrap().beat_grid().unwrap()[0].time_ms;
+        let with_cue = AnalysisSettings { first_beat_cue: true, ..settings };
+        let result = analyse_and_save(&state, &fresh, &share, &track_id(0), rbl_analysis::AnalysisPreset::Rbxport, &with_cue, &editor).unwrap();
+        assert!(result.added_first_beat_cue);
+        let memory: Vec<u32> = cues(&fresh).iter().filter(|cue| cue.is_memory()).map(|cue| cue.position_ms).collect();
+        assert_eq!(memory, [first_beat], "the index follows without a reload");
+        let again = analyse_and_save(&state, &fresh, &share, &track_id(0), rbl_analysis::AnalysisPreset::Rbxport, &with_cue, &editor).unwrap();
+        assert!(!again.added_first_beat_cue);
+        let stored: i64 = db.connection().query_row(
+            "SELECT COUNT(*) FROM djmdCue WHERE ContentID = ?1 AND Kind = 0 AND rb_local_deleted = 0", [track_id(0)], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(stored, 1);
+        // Key-only has no grid to place it on.
+        let key_with_cue = AnalysisSettings { bpm_grid: false, first_beat_cue: true, ..settings };
+        assert!(!analyse_and_save(&state, &fresh, &share, &track_id(0), rbl_analysis::AnalysisPreset::Rbxport, &key_with_cue, &editor).unwrap().added_first_beat_cue);
+
+        // A refused cue write says the analysis was saved and only the cue
+        // is missing, keeps the cause for the log, and adds nothing.
+        let marker = dir.path().join("backups").join(rbl_backup::journal::NAME);
+        std::fs::write(&marker, b"{}").unwrap();
+        let refused = add_first_beat_cue(&state, &fresh, &track_id(0), first_beat + 1_000).unwrap_err();
+        std::fs::remove_file(&marker).unwrap();
+        assert_eq!(refused.kind, ErrorKind::ReadOnly);
+        assert_eq!(refused.message, "The analysis was saved, but the first-beat memory cue could not be added.");
+        assert!(refused.detail.as_deref().is_some_and(|detail| detail.contains("library restore is unfinished")), "{:?}", refused.detail);
+        let memory: Vec<u32> = cues(&fresh).iter().filter(|cue| cue.is_memory()).map(|cue| cue.position_ms).collect();
+        assert_eq!(memory, [first_beat], "the index is unchanged");
+        let stored: i64 = db.connection().query_row(
+            "SELECT COUNT(*) FROM djmdCue WHERE ContentID = ?1 AND Kind = 0 AND rb_local_deleted = 0", [track_id(0)], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(stored, 1, "the database is unchanged");
+
         // Locks refuse both kinds of analysis before any files are rewritten.
         editor.set_locked(&track_id(0), true).unwrap();
         assert!(analyse_and_save(&state, &fresh, &share, &track_id(0), rbl_analysis::AnalysisPreset::Rbxport, &settings, &editor).is_err());
         assert!(analyse_and_save(&state, &fresh, &share, &track_id(0), rbl_analysis::AnalysisPreset::Rbxport, &key_only, &editor).is_err());
+    }
+
+    /// #156: a file longer than what is held for the tempo still gets a
+    /// waveform and a grid to its end, the same waveform it gets when it
+    /// is held whole.
+    #[test]
+    fn a_file_longer_than_the_held_head_is_drawn_and_gridded_to_its_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("long.wav");
+        write_click_wav(&audio, 24, 0.5);
+        let options = AnalysisSettings::default().options(rbl_analysis::AnalysisPreset::Rbxport).unwrap();
+
+        let (whole, whole_secs) = analyse_file(&audio, &options, 60.0).unwrap();
+        let (headed, headed_secs) = analyse_file(&audio, &options, 8.0).unwrap();
+        assert!((whole_secs - 24.0).abs() < 0.01 && (headed_secs - 24.0).abs() < 0.01, "{whole_secs} {headed_secs}");
+
+        // Every 1/150 s column of all 24 seconds, identical to the whole decode's.
+        assert_eq!(headed.waveform.columns.len(), 24 * 150);
+        assert_eq!(headed.waveform.columns, whole.waveform.columns);
+        let loud_after_head = headed.waveform.columns[20 * 150..].iter().filter(|c| c.peak > 100).count();
+        assert!(loud_after_head >= 8, "the clicks past the head are drawn: {loud_after_head}");
+        // The overview spans the whole file too: its last buckets have clicks.
+        assert!(headed.waveform.overview[1_100..].iter().any(|b| b.iter().any(|&v| v > 0)));
+        let off: usize = headed.waveform.overview.iter().flatten().zip(whole.waveform.overview.iter().flatten())
+            .map(|(&a, &b)| usize::from(a.abs_diff(b))).sum();
+        assert!(off <= 3 * 1_200 / 20, "{off}");
+
+        // The grid reaches the end, on the clicks, at the same tempo.
+        let last = headed.tempo.beats.last().unwrap().time_ms;
+        assert!(last > 23_000, "the grid stops at {last} ms");
+        // Beat for beat where the whole decode's grid has them; a beat that
+        // lands on the file's last millisecond may be in only one of the two.
+        assert!(headed.tempo.beats.len().abs_diff(whole.tempo.beats.len()) <= 1);
+        for (a, b) in headed.tempo.beats.iter().zip(&whole.tempo.beats) {
+            assert!(a.time_ms.abs_diff(b.time_ms) <= 20, "{} vs {}", a.time_ms, b.time_ms);
+        }
+        assert!(headed.tempo.beats.windows(2).all(|p| p[1].beat_number == p[0].beat_number % 4 + 1));
+        assert!((headed.peak - whole.peak).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_memory_cue_near_the_first_beat_counts_and_hot_cues_do_not() {
+        let cue = |kind: u8, position_ms: u32, out_ms: u32| rbl_index::Cue { id: 1, position_ms, out_ms, kind, colour: 0 };
+        assert!(needs_first_beat_cue(&[], 120));
+        assert!(!needs_first_beat_cue(&[cue(0, 120, 0)], 120));
+        assert!(!needs_first_beat_cue(&[cue(0, 125, 0)], 120), "within the tolerance");
+        assert!(!needs_first_beat_cue(&[cue(0, 120, 4_000)], 120), "a memory loop marks the beat too");
+        assert!(needs_first_beat_cue(&[cue(0, 126, 0)], 120));
+        assert!(needs_first_beat_cue(&[cue(1, 120, 0)], 120), "a hot cue is not a memory cue");
     }
 
     #[test]

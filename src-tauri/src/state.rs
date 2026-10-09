@@ -36,6 +36,9 @@ pub struct AppState {
     /// rather than reopened per selection. A `Mutex`, not `RwLock`, because a
     /// `rusqlite::Connection` is `Send` and not `Sync`.
     reader: parking_lot::Mutex<Option<rbl_db::Library>>,
+    /// The Missing File Manager's last scan, paged out to it a screenful at a
+    /// time. See [`crate::relocate::MissingScan`].
+    pub(crate) missing_scan: parking_lot::Mutex<Option<crate::relocate::MissingScan>>,
 }
 
 /// One reversible library operation. Grid edits keep their own history because
@@ -119,6 +122,8 @@ struct Inner {
     views: HashMap<u32, OpenView>,
     /// The Explorer's views, under the same ids and the same eviction.
     folders: HashMap<u32, Arc<FolderView>>,
+    /// The Devices tree's views of a stick's own library, likewise.
+    devices: HashMap<u32, Arc<rbl_index::device::DeviceView>>,
     /// Insertion order, for eviction.
     view_order: Vec<u32>,
     next_view_id: u32,
@@ -163,6 +168,7 @@ impl AppState {
             backup_dir,
             backup_destination: RwLock::new(backup_destination),
             reader: parking_lot::Mutex::new(None),
+            missing_scan: parking_lot::Mutex::new(None),
         }
     }
 
@@ -503,6 +509,19 @@ impl AppState {
         (id, len, inner.generation)
     }
 
+    /// Opens a view of a library on a stick; the same handle shape.
+    pub fn open_device_view(&self, view: rbl_index::device::DeviceView) -> (u32, u32, u32) {
+        let len = u32::try_from(view.len()).unwrap_or(u32::MAX);
+        let mut inner = self.inner.write();
+        let id = inner.register(Registered::Device(Arc::new(view)));
+        (id, len, inner.generation)
+    }
+
+    /// The device view behind an id, or `None` for any other kind of id.
+    pub fn device_view(&self, view_id: u32) -> Option<Arc<rbl_index::device::DeviceView>> {
+        self.inner.read().devices.get(&view_id).cloned()
+    }
+
     /// The folder view behind an id, or `None` when the id is a library view
     /// or nothing at all.
     pub fn folder_view(&self, view_id: u32) -> Option<Arc<FolderView>> {
@@ -527,6 +546,7 @@ fn default_backup_dir() -> std::path::PathBuf {
 enum Registered {
     Library(OpenView),
     Folder(Arc<FolderView>),
+    Device(Arc<rbl_index::device::DeviceView>),
 }
 
 impl Inner {
@@ -542,12 +562,16 @@ impl Inner {
             Registered::Folder(view) => {
                 self.folders.insert(id, view);
             }
+            Registered::Device(view) => {
+                self.devices.insert(id, view);
+            }
         }
         self.view_order.push(id);
         while self.view_order.len() > MAX_VIEWS {
             let oldest = self.view_order.remove(0);
             self.views.remove(&oldest);
             self.folders.remove(&oldest);
+            self.devices.remove(&oldest);
         }
         id
     }
@@ -568,8 +592,29 @@ pub fn sort_from_wire(name: &str) -> SortColumn {
         "bpm" => SortColumn::Bpm,
         "duration" => SortColumn::Duration,
         "rating" => SortColumn::Rating,
+        "djPlayCount" => SortColumn::PlayCount,
         "dateAdded" => SortColumn::DateAdded,
         "releaseDate" => SortColumn::ReleaseDate,
+        "size" => SortColumn::Size,
+        "year" => SortColumn::Year,
+        "sampleRate" => SortColumn::SampleRate,
+        "bitrate" => SortColumn::Bitrate,
+        "color" => SortColumn::Color,
+        "fileName" => SortColumn::FileName,
+        "location" => SortColumn::Location,
+        "composer" => SortColumn::Composer,
+        "albumArtist" => SortColumn::AlbumArtist,
+        "remixer" => SortColumn::Remixer,
+        "originalArtist" => SortColumn::OriginalArtist,
+        "mixName" => SortColumn::MixName,
+        "discNo" => SortColumn::DiscNo,
+        "trackNumber" => SortColumn::TrackNumber,
+        "fileType" => SortColumn::FileType,
+        "bitDepth" => SortColumn::BitDepth,
+        "lyricist" => SortColumn::Lyricist,
+        "dateCreated" => SortColumn::DateCreated,
+        "publishTrackInfo" => SortColumn::PublishTrackInfo,
+        "message" => SortColumn::Message,
         _ => SortColumn::TrackNo,
     }
 }
@@ -582,7 +627,7 @@ pub fn spec_from_wire(library: &Library, dto: &ViewSpecDto) -> ViewSpec {
         // A folder never reaches the index: `open_view` opens one through
         // `explorer::open_folder` before translating. The collection is what
         // the sort and query here would apply to if it ever did.
-        TrackSourceDto::Collection | TrackSourceDto::Folder { .. } => TrackSource::Collection,
+        TrackSourceDto::Collection | TrackSourceDto::Folder { .. } | TrackSourceDto::Device { .. } => TrackSource::Collection,
         TrackSourceDto::History { id } => id
             .parse::<u64>()
             .ok()
@@ -717,6 +762,7 @@ pub fn rows_to_dto(library: &Library, rows: &[rbl_index::Row], first_position: u
                 )
                 .unwrap_or(0),
                 file_name: library.file_name.get(index).to_owned(),
+                missing: crate::relocate::is_missing(library.folder_path.get(index)),
                 extra: None,
             }
         })
@@ -728,9 +774,9 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
     use rbl_index::testing::{library_from, TestTrack};
-    use rbl_index::Cue;
+    use rbl_index::{Cue, SortColumn};
 
-    use super::rows_to_dto;
+    use super::{rows_to_dto, sort_from_wire};
 
     fn cue(kind: u8, position_ms: u32, colour: u8) -> Cue {
         Cue { position_ms, kind, colour, ..Cue::default() }
@@ -755,6 +801,43 @@ mod tests {
             json["hotCues"],
             serde_json::json!([["A", 46, "#3CEB50"], ["B", 165_046, "#E02823"], ["C", 2000, null], ["E", 24, "#10B176"]])
         );
+    }
+
+    #[test]
+    fn the_dj_play_count_wire_key_uses_the_numeric_index() {
+        assert_eq!(sort_from_wire("djPlayCount"), SortColumn::PlayCount);
+    }
+
+    #[test]
+    fn every_sortable_browser_column_has_its_own_wire_key() {
+        // The frontend's column keys, which are what it sends as the sort.
+        let wire = [
+            ("title", SortColumn::Title), ("artist", SortColumn::Artist), ("album", SortColumn::Album),
+            ("genre", SortColumn::Genre), ("label", SortColumn::Label), ("comment", SortColumn::Comment),
+            ("key", SortColumn::Key), ("keyCamelot", SortColumn::KeyCamelot), ("bpm", SortColumn::Bpm),
+            ("duration", SortColumn::Duration), ("rating", SortColumn::Rating),
+            ("djPlayCount", SortColumn::PlayCount), ("dateAdded", SortColumn::DateAdded),
+            ("releaseDate", SortColumn::ReleaseDate), ("size", SortColumn::Size), ("year", SortColumn::Year),
+            ("sampleRate", SortColumn::SampleRate), ("bitrate", SortColumn::Bitrate),
+            ("color", SortColumn::Color), ("fileName", SortColumn::FileName),
+            ("location", SortColumn::Location), ("composer", SortColumn::Composer),
+            ("albumArtist", SortColumn::AlbumArtist), ("remixer", SortColumn::Remixer),
+            ("originalArtist", SortColumn::OriginalArtist), ("mixName", SortColumn::MixName),
+            ("discNo", SortColumn::DiscNo), ("trackNumber", SortColumn::TrackNumber),
+            ("fileType", SortColumn::FileType), ("bitDepth", SortColumn::BitDepth),
+            ("lyricist", SortColumn::Lyricist), ("dateCreated", SortColumn::DateCreated),
+            ("publishTrackInfo", SortColumn::PublishTrackInfo), ("message", SortColumn::Message),
+        ];
+        for (name, column) in wire {
+            assert_eq!(sort_from_wire(name), column, "{name}");
+        }
+        // Every index column but the view's own order is reachable.
+        let reached: std::collections::HashSet<_> = wire.iter().map(|&(_, column)| column).collect();
+        for column in SortColumn::ALL {
+            assert!(column == SortColumn::TrackNo || reached.contains(&column), "{column:?} has no wire key");
+        }
+        assert_eq!(sort_from_wire("hotCue"), SortColumn::TrackNo, "Hot Cue is not sortable");
+        assert_eq!(sort_from_wire("trackNo"), SortColumn::TrackNo);
     }
 
     #[test]

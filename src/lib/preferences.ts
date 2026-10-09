@@ -70,6 +70,22 @@ export function browseScale(step: number): number {
   return BROWSE_SCALES[step] ?? 1;
 }
 
+/**
+ * Browse › FontSize, Bold and Line Space as the CSS custom properties the
+ * browser's lists draw with, so the track table and the playlist tree share
+ * one rule. `rowBase` is the measured row height in px (`--s-row-height`).
+ */
+export function browseListVars(
+  view: { browseFontSize: number; browseLineSpace: number; browseBold: boolean },
+  rowBase: number,
+): Record<string, string | number> {
+  return {
+    "--s-row-height": `${Math.round(rowBase * browseScale(view.browseLineSpace))}px`,
+    "--f-size-ui": `calc(${browseScale(view.browseFontSize)} * var(--f-size-ui-base))`,
+    "--browse-weight": view.browseBold ? 700 : 400,
+  };
+}
+
 export type VuMeterMode = "normal" | "fabulous";
 
 export const LOCALES = [
@@ -153,6 +169,8 @@ export interface AnalysisPreferences {
   concurrentTracks: number;
   /** Auto Analysis: analyse a track when it is added to the library. */
   auto: boolean;
+  /** Add a memory cue on the first beat; also the Analysis Setting default. */
+  firstBeatCue: boolean;
 }
 
 /**
@@ -190,8 +208,18 @@ export const UPDATE_FREQUENCIES = ["start", "daily", "weekly"] as const;
 export type UpdateFrequency = (typeof UPDATE_FREQUENCIES)[number];
 
 export interface AdvancedPreferences {
-  /** Auto Relocate Search Folders › Specified user folders. */
+  /** Auto Relocate Search Folders › Specified user folders: the list. */
   relocateFolders: string[];
+  /**
+   * Auto Relocate Search Folders' boxes [OBS rekordbox 7.2.19 static,
+   * `DetailAutoRelocate` and `SettingIF::isSelectedAutoRelocate*Folder`]:
+   * Music, Video and Desktop are searched by default; the Specified user
+   * folders only once that box is ticked.
+   */
+  relocateMusic: boolean;
+  relocateVideo: boolean;
+  relocateDesktop: boolean;
+  relocateUserFolders: boolean;
   /** Library Protection: refuse every edit, whatever rekordbox is doing. */
   protectLibrary: boolean;
   /** Edit Library › Double-click to edit; off is a click on a selected row. */
@@ -222,7 +250,7 @@ export interface Preferences {
   advanced: AdvancedPreferences;
   keyboard: KeyboardPreferences;
   usbExport: {
-    importSettings: boolean; importHistory: boolean; deleteUnlistedMusic: boolean; maximumCompatibility: boolean; conversionFormat: "wav" | "mp3";
+    importSettings: boolean; importHistory: boolean; deleteUnlistedMusic: boolean; maximumCompatibility: boolean; conversionFormat: "wav" | "aiff" | "mp3";
     /** What Sync Manager's Import button has ticked when the window opens. */
     importButtonCues: boolean; importButtonHistory: boolean; importButtonSettings: boolean;
   };
@@ -275,6 +303,7 @@ export const DEFAULT_PREFERENCES: Preferences = {
     mode: "rbxport",
     concurrentTracks: SLOTS,
     auto: false,
+    firstBeatCue: false,
   },
   djSystem: {
     waveformColor: "3band",
@@ -292,6 +321,10 @@ export const DEFAULT_PREFERENCES: Preferences = {
   usbExport: { importSettings: false, importHistory: true, deleteUnlistedMusic: false, maximumCompatibility: false, conversionFormat: "wav", importButtonCues: true, importButtonHistory: true, importButtonSettings: false },
   advanced: {
     relocateFolders: [],
+    relocateMusic: true,
+    relocateVideo: true,
+    relocateDesktop: true,
+    relocateUserFolders: false,
     protectLibrary: true,
     doubleClickToEdit: false,
     syncType: "beat",
@@ -401,7 +434,7 @@ export function sanitisePreferences(value: unknown): Preferences {
   const d = DEFAULT_PREFERENCES;
   return {
     rekordbox: { syncBrowseSettings: bool(rekordbox.syncBrowseSettings, true) },
-    usbExport: { importSettings: bool(usb.importSettings, false), importHistory: bool(usb.importHistory, true), deleteUnlistedMusic: bool(usb.deleteUnlistedMusic, false), maximumCompatibility: bool(usb.maximumCompatibility, false), conversionFormat: usb.conversionFormat === "mp3" ? "mp3" : "wav", importButtonCues: bool(usb.importButtonCues, true), importButtonHistory: bool(usb.importButtonHistory, true), importButtonSettings: bool(usb.importButtonSettings, false) },
+    usbExport: { importSettings: bool(usb.importSettings, false), importHistory: bool(usb.importHistory, true), deleteUnlistedMusic: bool(usb.deleteUnlistedMusic, false), maximumCompatibility: bool(usb.maximumCompatibility, false), conversionFormat: oneOf(usb.conversionFormat, ["wav", "aiff", "mp3"] as const, "wav"), importButtonCues: bool(usb.importButtonCues, true), importButtonHistory: bool(usb.importButtonHistory, true), importButtonSettings: bool(usb.importButtonSettings, false) },
     view: {
       locale: oneOf(view.locale, LOCALES, d.view.locale),
       showBpmChanges: bool(view.showBpmChanges, d.view.showBpmChanges),
@@ -442,6 +475,7 @@ export function sanitisePreferences(value: unknown): Preferences {
       mode: oneOf(analysis.mode, ["rekordbox", "rbxport"], d.analysis.mode),
       concurrentTracks: oneOfNumber(analysis.concurrentTracks, ANALYSIS_SLOTS, SLOTS),
       auto: bool(analysis.auto, d.analysis.auto),
+      firstBeatCue: bool(analysis.firstBeatCue, d.analysis.firstBeatCue),
     },
     djSystem: {
       waveformColor: oneOf(dj.waveformColor, WAVEFORM_COLORS, d.djSystem.waveformColor),
@@ -460,6 +494,14 @@ export function sanitisePreferences(value: unknown): Preferences {
     },
     advanced: {
       relocateFolders: strings(advanced.relocateFolders),
+      relocateMusic: bool(advanced.relocateMusic, d.advanced.relocateMusic),
+      relocateVideo: bool(advanced.relocateVideo, d.advanced.relocateVideo),
+      relocateDesktop: bool(advanced.relocateDesktop, d.advanced.relocateDesktop),
+      // Folders saved before the box existed were being searched: keep them so.
+      relocateUserFolders: bool(
+        advanced.relocateUserFolders,
+        strings(advanced.relocateFolders).length > 0 || d.advanced.relocateUserFolders,
+      ),
       recordHistory: bool(advanced.recordHistory, d.advanced.recordHistory),
       // A stored object predates this switch when the key is absent. Preserve
       // that user's writable library; only a truly empty store gets defaults.

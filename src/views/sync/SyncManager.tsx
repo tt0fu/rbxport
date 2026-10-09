@@ -14,13 +14,14 @@
  * reading the stick.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, ArrowLeft, ArrowRight, LoaderCircle, Search, X } from "lucide-react";
+import { ArrowLeft, ArrowRight, LoaderCircle, Search, X } from "lucide-react";
 
 import { EjectIcon, FolderIcon, ListIcon, SmartListIcon } from "@/components/icons";
 import { getBackend } from "@/ipc/client";
 import type { Device, DeviceSyncState, ExportReport, ItunesLibrary, TreeNode } from "@/ipc/types";
 import { formatSpace } from "@/lib/devices";
 import { errorMessage } from "@/lib/errorMessage";
+import { askToReplaceLists } from "@/lib/xmlImport";
 import { nodesForSource, subtreeIds, toggle, visibleNodes } from "@/lib/tree";
 import { startWindowDrag, toggleWindowMaximise } from "@/lib/windowDrag";
 import { usePreferences } from "@/store/usePreferences";
@@ -213,22 +214,50 @@ export function SyncManager({ windowed = false, onClose, onSynced, onReady }: Sy
     };
   }, []);
 
-  // The same tree the shell fetches, once, on open. Its folders open one
-  // level deep, as rekordbox's manager opens them: the top folders show,
-  // and what is inside them waits to be asked for.
+  // The same tree the shell fetches, on open and again whenever the library
+  // changes, so a playlist made while this is open can be ticked. Its
+  // folders open one level deep, as rekordbox's manager opens them: the top
+  // folders show, and what is inside them waits to be asked for. A re-read
+  // keeps the folders as they were opened or closed; only folders it has
+  // not seen before start closed.
   useEffect(() => {
     let live = true;
-    void getBackend()
-      .then((backend) => backend.playlistTree())
-      .then((read) => {
-        if (!live) return;
-        setTree(read);
-        setCollapsed(new Set(playlistNodes(read).filter((n) => n.kind === "folder" && n.depth > 1).map((n) => n.id)));
-      })
-      .catch(() => { if (live) setTreeError("Couldn’t load playlists. Reopen Sync Manager to try again."); })
-      .finally(() => { if (live) setLoadingTree(false); });
+    let stop: (() => void) | undefined;
+    const seen = new Set<string>();
+    // Each read is numbered so a slow one cannot overwrite a newer one.
+    let latest = 0;
+    const read = async () => {
+      const mine = ++latest;
+      try {
+        const backend = await getBackend();
+        const tree = await backend.playlistTree();
+        if (!live || mine !== latest) return;
+        const nodes = playlistNodes(tree);
+        const fresh = nodes.filter((n) => n.kind === "folder" && n.depth > 1 && !seen.has(n.id)).map((n) => n.id);
+        for (const node of nodes) seen.add(node.id);
+        const present = new Set(nodes.map((n) => n.id));
+        setTree(tree);
+        setTreeError("");
+        setCollapsed((current) => new Set([...[...current].filter((id) => present.has(id)), ...fresh]));
+        // A deleted playlist is not something SYNC can be asked for.
+        setTicked((current) => {
+          const kept = [...current].filter((id) => present.has(id));
+          return kept.length === current.size ? current : new Set(kept);
+        });
+      } catch {
+        if (live && mine === latest) setTreeError("Couldn’t load playlists. Reopen Sync Manager to try again.");
+      } finally {
+        if (live && mine === latest) setLoadingTree(false);
+      }
+    };
+    void read();
+    void getBackend().then((backend) => {
+      if (!live) return;
+      stop = backend.onLibraryChanged(() => { void read(); });
+    });
     return () => {
       live = false;
+      stop?.();
     };
   }, []);
 
@@ -423,7 +452,13 @@ export function SyncManager({ windowed = false, onClose, onSynced, onReady }: Sy
           setStatus([t("Quit rekordbox to import from iTunes.")]);
           return;
         }
-        const report = await backend.importItunesSelected(itunes.path, ids);
+        // rekordbox asks before replacing same-named lists (#152); Cancel
+        // imports nothing.
+        const report = await backend.importItunesSelected(itunes.path, ids, () => askToReplaceLists(backend, t));
+        if (report === null) {
+          setStatus([]);
+          return;
+        }
         // Show the imported playlists in the rekordbox column at once.
         setTree(await backend.playlistTree());
         setItunesTicked(new Set());
@@ -545,6 +580,20 @@ export function SyncManager({ windowed = false, onClose, onSynced, onReady }: Sy
     })();
   }, [canSync, nodes, ticked, tickedDevices, importHistory, importSettings, stickDefaults, ejectAfterSync, deleteUnlistedMusic, compatibilityFormat, refreshDevices, readDevice, onSynced, t]);
 
+  /** One line for a cue import: what changed, and what already matched. */
+  const cuesResult = (device: string, result: { tracks: number; skipped: number; unchanged?: number }) => {
+    const unchanged = result.unchanged ?? 0;
+    if (result.tracks === 0 && unchanged > 0 && result.skipped === 0) {
+      return t("{device}: cues and beat grids already match your library; nothing was changed.", { device });
+    }
+    const parts = [result.tracks === 1
+      ? t("{device}: updated {count} track", { device, count: result.tracks })
+      : t("{device}: updated {count} tracks", { device, count: result.tracks })];
+    if (unchanged > 0) parts.push(t("{count} already up to date", { count: unchanged }));
+    if (result.skipped > 0) parts.push(t("skipped {count}", { count: result.skipped }));
+    return `${parts.join("; ")}.`;
+  };
+
   const runUsbImport = (kinds: readonly ImportKind[]) => {
     if (busy || tickedDevices.size === 0 || kinds.length === 0) return;
     setOperation("import");
@@ -564,9 +613,21 @@ export function SyncManager({ windowed = false, onClose, onSynced, onReady }: Sy
             setStatus([t("Waiting for USB activity to finish, then importing {kind} from {device}…", { kind: noun, device: device.name })]);
             try {
               const result = await backend.importUsb(device.path, kind === "cues", kind === "history", kind === "settings");
-              if (kind === "cues") results.push(`${device.name}: updated ${result.tracks} tracks${result.skipped ? `; skipped ${result.skipped}` : ""}.`);
-              else if (kind === "history") results.push(result.histories ? `${device.name}: imported ${result.histories} play-history entries.` : `${device.name}: no new play-history entries.`);
-              else results.push(result.settings ? `${device.name}: imported ${result.settings} CDJ/mixer settings files.` : `${device.name}: no CDJ/mixer settings files found.`);
+              if (kind === "cues") results.push(cuesResult(device.name, result));
+              else if (kind === "history") results.push(result.histories === 1
+                ? t("{device}: imported {count} play-history entry.", { device: device.name, count: result.histories })
+                : result.histories
+                  ? t("{device}: imported {count} play-history entries.", { device: device.name, count: result.histories })
+                  : t("{device}: no new play-history entries.", { device: device.name }));
+              // Kept as RBXport's My Settings: a stick synced later that has
+              // none of its own is given them, as rekordbox's imported My
+              // Settings go to the sticks it writes. Nothing in the library
+              // changes, so say where they went rather than imply an update.
+              else results.push(result.settings === 1
+                ? t("{device}: imported {count} CDJ/mixer settings file. Sync gives it to USB devices that have no settings of their own.", { device: device.name, count: result.settings })
+                : result.settings
+                  ? t("{device}: imported {count} CDJ/mixer settings files. Sync gives them to USB devices that have no settings of their own.", { device: device.name, count: result.settings })
+                  : t("{device}: no CDJ/mixer settings files found.", { device: device.name }));
               if (result.warnings?.length) results.push(...result.warnings.map(warning => `${device.name}: ${warning}`));
             } catch (e) {
               setImportFailed(true);
@@ -789,10 +850,6 @@ export function SyncManager({ windowed = false, onClose, onSynced, onReady }: Sy
               const read = states.get(device.path);
               const job = exportJobs.get(device.path);
               const fileSystem = device.fileSystem?.toUpperCase().replace(/^VFAT$|^MSDOS$/, "FAT") || "Unknown filesystem";
-              // Linux exposes FAT volumes through the `vfat` driver, even when the
-              // volume itself is FAT32. Treat that kernel driver name as compatible
-              // so the same stick does not get a warning only on Linux.
-              const fat32Recommended = !["FAT32", "VFAT"].includes(device.fileSystem?.trim().toUpperCase() ?? "");
               const free = device.totalBytes > 0 ? `${device.freeBytes === 0 ? "0.0 GB" : formatSpace(device.freeBytes)} free (${Math.round(device.freeBytes / device.totalBytes * 100)}%)` : "Space unknown";
               const freePercent = device.totalBytes > 0 ? Math.max(0, Math.min(100, device.freeBytes / device.totalBytes * 100)) : null;
               const usedPercent = freePercent === null ? null : 100 - freePercent;
@@ -806,9 +863,6 @@ export function SyncManager({ windowed = false, onClose, onSynced, onReady }: Sy
                     }} />
                   <label className={styles.rowSelection}>
                   <span className={styles.name} title={device.path}>{device.name}</span>
-                  {fat32Recommended ? <span className={styles.filesystemWarning} title={t("Pioneer DJ recommends FAT32")}>
-                    <AlertTriangle aria-label={t("Pioneer DJ recommends FAT32")} />
-                  </span> : null}
                   <TickBox state={on ? "on" : "off"} label={device.name} disabled={busy} onChange={(next) => tickDevice(device.path, next)} />
                   </label>
                   <button type="button" className={styles.ejectButton}

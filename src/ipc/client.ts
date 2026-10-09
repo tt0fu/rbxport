@@ -6,14 +6,15 @@
  */
 import { detectPlatform } from "@/lib/shortcuts";
 import type {
-  AnalysisResult, AudioDevices, Backend, Backup, BackupProgress, BackupSizes, Cue, DeckEvent, Device, DeviceSettings, DeviceSyncState,
+  AnalysisResult, AudioDevices, Backend, Backup, BackupProgress, BackupSizes, ConfirmReplace, Cue, DeckEvent, Device, DeviceLibrary,
+  DevicePlaylistEditResult, DeviceSettings, DeviceSyncState,
   Diagnostics, Duplicates, GridState, Limiter, PreferencesRequest, SmartRule, SyncDeviceReport, SyncProgress, UpdateCheck,
   UpdateProgress, UpdateReady, XmlImportReport,
-  ExportProgress, ExportReport, ExplorerChildren, ExplorerRoot, FilterValues, Phrase, ImportReport,
-  EditHistoryState, ItunesLibrary, LibraryProblem, LibrarySummary, LinkPeerSeen, Meters,
-  LinkStatus, MissingExportFile, MissingTracks, ReferenceStickSettings, RelocateReport, RowDto, ScriptRequest, Tick,
+  ExportProgress, ExportReport, ExplorerChildren, ExplorerRoot, FilterValues, FolderPlaylistReport, Phrase, ImportReport,
+  DatabaseDrive, EditHistoryState, ItunesLibrary, LibraryProblem, LibrarySummary, LinkPeerSeen, Meters,
+  LinkStatus, MissingExportFile, MissingTrack, MissingTracks, PreviewState, UnanalysedTracks, ReferenceStickSettings, RelocateReport, RowDto, ScriptRequest, Tick,
   TreeNode, ViewHandle,
-  TrackDetails, TrackLookups,
+  SelectionDetails, TrackDetails, TrackLookups,
 } from "./types";
 
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -82,6 +83,23 @@ export function subscribeNativeFileDrops(listener: (drop: NativeFileDrop) => voi
     live = false;
     stop?.();
   };
+}
+
+/**
+ * Runs a collection import, which replaces nothing unasked: when the file
+ * holds folders or playlists already standing in the library under the same
+ * name, the backend writes nothing and names them. Ask, as rekordbox does,
+ * and import again with `replace` only on OK. Null when declined.
+ */
+export async function importReplacing(
+  command: string,
+  args: Record<string, unknown>,
+  confirmReplace: ConfirmReplace,
+): Promise<XmlImportReport | null> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  const first = await invoke<XmlImportReport>(command, args);
+  return !first.sameNamed?.length ? first
+    : await confirmReplace(first.sameNamed) ? invoke<XmlImportReport>(command, { ...args, replace: true }) : null;
 }
 
 /** Keep the native Edit menu in sync with the focused editor's history. */
@@ -196,6 +214,8 @@ async function realBackend(): Promise<Backend> {
       return invoke<ImportReport>("import_files", { paths: picked });
     },
     importPaths: (paths) => invoke<ImportReport>("import_files", { paths }),
+    importFolderPlaylist: (path, parent, replace, at) =>
+      invoke<FolderPlaylistReport>("import_folder_playlist", { path, parent, replace: replace ?? null, at: at ?? null }),
     exportLoopWav: async (track, title, inMs, outMs) => {
       const { save } = await import("@tauri-apps/plugin-dialog");
       const picked = await save({
@@ -216,7 +236,7 @@ async function realBackend(): Promise<Backend> {
       if (typeof picked !== "string") return null;
       return invoke<number>("export_playlist_file", { playlist: playlistId, path: picked, format });
     },
-    importXml: async () => {
+    importXml: async (confirmReplace) => {
       const { open } = await import("@tauri-apps/plugin-dialog");
       const picked = await open({
         multiple: false,
@@ -225,9 +245,9 @@ async function realBackend(): Promise<Backend> {
         filters: [{ name: "rekordbox XML", extensions: ["xml"] }],
       });
       if (typeof picked !== "string") return null;
-      return invoke<XmlImportReport>("import_xml", { path: picked });
+      return importReplacing("import_xml", { path: picked }, confirmReplace);
     },
-    importItunes: async () => {
+    importItunes: async (confirmReplace) => {
       const { open } = await import("@tauri-apps/plugin-dialog");
       const picked = await open({
         multiple: false,
@@ -236,7 +256,7 @@ async function realBackend(): Promise<Backend> {
         filters: [{ name: "iTunes Library XML", extensions: ["xml"] }],
       });
       if (typeof picked !== "string") return null;
-      return invoke<XmlImportReport>("import_itunes", { path: picked });
+      return importReplacing("import_itunes", { path: picked }, confirmReplace);
     },
     itunesDefaultLibrary: () => invoke<ItunesLibrary | null>("itunes_default_library"),
     chooseItunesLibrary: async () => {
@@ -250,7 +270,8 @@ async function realBackend(): Promise<Backend> {
       if (typeof picked !== "string") return null;
       return invoke<ItunesLibrary>("itunes_library_at", { path: picked });
     },
-    importItunesSelected: (path, ids) => invoke<XmlImportReport>("import_itunes_selected", { path, ids: [...ids] }),
+    importItunesSelected: (path, ids, confirmReplace) =>
+      importReplacing("import_itunes_selected", { path, ids: [...ids] }, confirmReplace),
     exportXml: async () => {
       const { save } = await import("@tauri-apps/plugin-dialog");
       const picked = await save({
@@ -261,32 +282,20 @@ async function realBackend(): Promise<Backend> {
       if (typeof picked !== "string") return null;
       return invoke<number>("export_xml", { path: picked });
     },
-    exportPlaylist: async (playlistId, destination, defaults, deleteUnlistedMusic, compatibilityFormat) => {
-      let target = destination;
-      if (target === undefined) {
-        const { open } = await import("@tauri-apps/plugin-dialog");
-        const picked = await open({
-          multiple: false,
-          directory: true,
-          title: "Choose where to write the export",
-        });
-        // Cancelling is a normal outcome, not an error.
-        if (typeof picked !== "string") return null;
-        target = picked;
-      }
-      return invoke<ExportReport>("export_playlist", {
+    exportPlaylist: (playlistId, destination, defaults, deleteUnlistedMusic, compatibilityFormat) =>
+      invoke<ExportReport>("export_playlist", {
         playlist: playlistId,
-        destination: target,
+        destination,
         defaults: defaults ?? null,
         deleteUnlistedMusic: deleteUnlistedMusic ?? false,
         compatibilityFormat: compatibilityFormat ?? null,
-      });
-    },
+      }),
     exportTracksToDevice: (tracks, destination, defaults, compatibilityFormat) =>
       invoke<ExportReport>("export_tracks_to_device", { tracks, destination, defaults: defaults ?? null, compatibilityFormat: compatibilityFormat ?? null }),
     referenceStickSettings: () => invoke<ReferenceStickSettings>("reference_stick_settings"),
     listDevices: () => invoke<Device[]>("list_devices"),
     onExportProgress: (listener) => subscribe<ExportProgress>("export:progress", listener),
+    onImportProgress: (listener) => subscribe<ExportProgress>("import:progress", listener),
     exportProgress: () => invoke<ExportProgress[]>("export_progress"),
     cancelExport: (path) => invoke<void>("cancel_export", { path }),
     listBackups: () => invoke<Backup[]>("list_backups"),
@@ -302,7 +311,15 @@ async function realBackend(): Promise<Backend> {
     deleteBackup: (path) => invoke<void>("delete_backup", { path }),
     confirm: async (message, labels) => {
       const { ask } = await import("@tauri-apps/plugin-dialog");
-      return ask(message, { kind: "warning", ...(labels ? { okLabel: labels.yes, cancelLabel: labels.no } : {}) });
+      return ask(message, {
+        kind: "warning",
+        ...(labels ? { okLabel: labels.yes, cancelLabel: labels.no } : {}),
+        ...(labels?.title ? { title: labels.title } : {}),
+      });
+    },
+    tell: async (text, title) => {
+      const { message } = await import("@tauri-apps/plugin-dialog");
+      await message(text, { title, kind: "info" });
     },
     deckLoad: (deck, trackId, loadId) => invoke<void>("deck_load", { deck, track: trackId, loadId }),
     deckUnload: (deck) => invoke<void>("deck_unload", { deck }),
@@ -310,6 +327,10 @@ async function realBackend(): Promise<Backend> {
     deckPlayAfter: (deck, delayMs) => invoke<void>("deck_play_after", { deck, delayMs }),
     deckPause: (deck) => invoke<void>("deck_pause", { deck }),
     deckSeek: (deck, positionMs) => invoke<void>("deck_seek", { deck, positionMs }),
+    deckMove: (deck, byMs) => invoke<void>("deck_move", { deck, byMs }),
+    previewPlay: (track, positionMs) => invoke<void>("preview_play", { track, positionMs }),
+    previewStop: () => invoke<void>("preview_stop"),
+    previewState: () => invoke<PreviewState>("preview_state"),
     deckSetLoop: (deck, inMs, outMs) => invoke<void>("deck_set_loop", { deck, inMs, outMs }),
     deckLoopActive: (deck, on) => invoke<void>("deck_loop_active", { deck, on }),
     deckClearLoop: (deck) => invoke<void>("deck_clear_loop", { deck }),
@@ -329,6 +350,7 @@ async function realBackend(): Promise<Backend> {
     deckTempo: (deck, tempo) => invoke<void>("deck_tempo", { deck, tempo }),
     deckMasterTempo: (deck, on) => invoke<void>("deck_master_tempo", { deck, on }),
     deckMetronome: (deck, on) => invoke<void>("deck_metronome", { deck, on }),
+    setMetronomeGrid: (deck, beats) => invoke<void>("deck_metronome_grid", { deck, beats }),
     deckKeyShift: (deck, semitones) => invoke<void>("deck_key_shift", { deck, semitones }),
     setMetronome: (sound, volume) => invoke<void>("set_metronome", { sound, volume }),
     setAudioConfig: (sampleRate, bufferFrames) =>
@@ -362,6 +384,9 @@ async function realBackend(): Promise<Backend> {
     onLibraryProblem: (listener) => subscribe<LibraryProblem>("library:problem", listener),
     libraryProblem: () => invoke<LibraryProblem | null>("library_problem"),
     createLibrary: () => invoke<void>("create_library"),
+    useDefaultLibrary: () => invoke<void>("use_default_library"),
+    databaseDrives: () => invoke<DatabaseDrive[]>("database_drives"),
+    switchLibrary: (masterDb) => invoke<void>("switch_library", { masterDb }),
     onCuesChanged: (listener) => subscribe<string>("cues:changed", listener),
     onGridChanged: (listener) => subscribe<string>("grid:changed", listener),
     onAnalysisChanged: (listener) => subscribe<string>("analysis:changed", listener),
@@ -396,9 +421,9 @@ async function realBackend(): Promise<Backend> {
     linkStatus: () => invoke<LinkStatus>("link_status"),
     linkPeers: () => invoke<LinkPeerSeen[]>("link_peers"),
     onLinkPeers: (listener) => subscribe<LinkPeerSeen[]>("link:peers", listener),
-    startLinkExport: (iface, keyDisplay, keySort) => invoke<LinkStatus>("start_link_export", {
+    startLinkExport: (iface, settings, keySort) => invoke<LinkStatus>("start_link_export", {
       interface: iface ?? null,
-      alphanumericKeys: keyDisplay === "alphanumeric",
+      deviceSettings: settings ?? null,
       alphabeticalKeys: keySort === "alphabetical",
     }),
     stopLinkExport: () => invoke<LinkStatus>("stop_link_export"),
@@ -407,27 +432,35 @@ async function realBackend(): Promise<Backend> {
     nudgeLinkMaster: (deltaBpm) => invoke<LinkStatus>("link_nudge_master", { deltaBpm }),
     takeLinkMasterTempo: () => invoke<LinkStatus>("link_take_master_tempo"),
     onLinkStatus: (listener) => subscribe<LinkStatus>("link:status", listener),
-    missingTracks: (limit) => invoke<MissingTracks>("missing_tracks", { limit }),
+    missingTracks: (offset, limit, rescan) => invoke<MissingTracks>("missing_tracks", { offset, limit, rescan }),
+    removeMissingTracks: (tracks) => invoke<number>("remove_missing_tracks", { tracks }),
+    unanalysedTracks: (from, limit) => invoke<UnanalysedTracks>("unanalysed_tracks", { from, limit }),
     findDuplicates: (limit) => invoke<Duplicates>("find_duplicates", { limit }),
-    relocateTrack: async (trackId) => {
+    // rekordbox's chooser [OBS 7.2.19 static, `MissingFileTable::showFileChooser`
+    // @0x1012a82c0]: "Choose a new fullpath for : <file name>", only files of
+    // the track's own extension ("*" + `getFileExtension()`), opened where the
+    // last Relocate found its file, and the first time in the Music folder
+    // (`getSpecialLocation(userMusicDirectory)` @0x1012a6a14).
+    chooseRelocateFile: async (title, fileName, folder) => {
       const { open } = await import("@tauri-apps/plugin-dialog");
+      const { audioDir } = await import("@tauri-apps/api/path");
+      const defaultPath = folder ?? (await audioDir().catch(() => null));
+      const dot = fileName.lastIndexOf(".");
+      const extension = dot > 0 ? fileName.slice(dot + 1) : "";
       const picked = await open({
         multiple: false,
         directory: false,
-        title: "Choose the file for this track",
-        filters: [
-          {
-            name: "Audio",
-            extensions: ["mp3", "m4a", "aiff", "aif", "wav", "flac", "aac", "ogg"],
-          },
-        ],
+        title,
+        ...(extension !== "" ? { filters: [{ name: `*.${extension}`, extensions: [extension] }] } : {}),
+        ...(defaultPath !== null ? { defaultPath } : {}),
       });
       // Cancelling is a normal outcome, not an error.
-      if (typeof picked !== "string") return null;
-      await invoke<number>("relocate_track", { track: trackId, path: picked });
-      return picked;
+      return typeof picked === "string" ? picked : null;
     },
-    autoRelocate: (folders) => invoke<RelocateReport>("auto_relocate", { folders }),
+    relocateTrack: (trackId, path) => invoke<boolean>("relocate_track", { track: trackId, path }),
+    relocationTargets: (tracks) => invoke<MissingTrack[]>("relocation_targets", { tracks }),
+    relocateByLocation: (tracks, from, to) => invoke<number>("relocate_by_location", { tracks, from, to }),
+    autoRelocate: (search, tracks) => invoke<RelocateReport>("auto_relocate", { search, tracks }),
     pickImage: async (title) => {
       const { open } = await import("@tauri-apps/plugin-dialog");
       const picked = await open({
@@ -488,6 +521,9 @@ async function realBackend(): Promise<Backend> {
       invoke<DeviceSettings>("ensure_device_library", { path, defaults: defaults ?? null }),
     explorerRoots: () => invoke<ExplorerRoot[]>("explorer_roots"),
     explorerChildren: (path) => invoke<ExplorerChildren>("explorer_children", { path }),
+    deviceLibraries: (path) => invoke<DeviceLibrary[]>("device_libraries", { path }),
+    devicePlaylistEdit: (path, format, edit) =>
+      invoke<DevicePlaylistEditResult>("device_playlist_edit", { path, format, edit }),
     onLibraryChanged: (listener) => {
       // Tauri's listen resolves asynchronously; unsubscribing before it does
       // has to still work, so the flag is checked when it lands.
@@ -529,9 +565,9 @@ async function realBackend(): Promise<Backend> {
       removeFromCollection: (tracks) => invoke<number>("remove_from_collection", { tracks }),
       reorderPlaylist: (playlist, tracks) =>
         invoke<number>("reorder_playlist", { playlist, tracks }),
-      setTrackRating: (track, stars) => invoke<EditHistoryState>("set_track_rating", { track, stars }),
-      setTrackComment: (track, comment) => invoke<EditHistoryState>("set_track_comment", { track, comment }),
-      setTrackColor: (track, color) => invoke<EditHistoryState>("set_track_color", { track, color }),
+      setTrackRating: (tracks, stars) => invoke<EditHistoryState>("set_track_rating", { tracks, stars }),
+      setTrackComment: (tracks, comment) => invoke<EditHistoryState>("set_track_comment", { tracks, comment }),
+      setTrackColor: (tracks, color) => invoke<EditHistoryState>("set_track_color", { tracks, color }),
       addCue: (track, kind, positionMs) => invoke<string>("add_cue", { track, kind, positionMs }),
       addLoop: (track, kind, inMs, outMs, beats) =>
         invoke<string>("add_loop", { track, kind, inMs, outMs, beats: beats ?? null }),
@@ -546,15 +582,16 @@ async function realBackend(): Promise<Backend> {
       gridRedo: (track, deck) => invoke<GridState>("grid_redo", { track, deck: deck ?? null }),
       gridLock: (track, on) => invoke<GridState>("grid_lock", { track, on }),
       convertMemoryCuesToHot: (track) => invoke<number>("convert_memory_cues_to_hot", { track }),
-      setTrackField: (track, field, value) =>
-        invoke<EditHistoryState>("set_track_field", { track, field, value }),
-      addArtwork: (track, image) => invoke<EditHistoryState>("add_artwork", { track, image }),
+      setTrackField: (tracks, field, value) =>
+        invoke<EditHistoryState>("set_track_field", { tracks, field, value }),
+      addArtwork: (tracks, image) => invoke<EditHistoryState>("add_artwork", { tracks, image }),
       addPlaylistArtwork: (playlist, image) => invoke<number>("add_playlist_artwork", { playlist, image }),
       setMyTags: (track, tags) => invoke<EditHistoryState>("set_my_tags", { track, tags }),
-      clearArtwork: (track) => invoke<EditHistoryState>("clear_artwork", { track }),
+      clearArtwork: (tracks) => invoke<EditHistoryState>("clear_artwork", { tracks }),
     },
     filterValues: (spec) => invoke<FilterValues>("filter_values", { spec }),
     trackDetails: (trackId) => invoke<TrackDetails>("track_details", { track: trackId }),
+    selectionDetails: (trackIds) => invoke<SelectionDetails>("selection_details", { tracks: trackIds }),
     trackLookups: () => invoke<TrackLookups>("track_lookups"),
   };
 }

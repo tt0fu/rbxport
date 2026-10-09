@@ -14,16 +14,17 @@ import theme from "@/styles/theme";
 
 import type {
   AppErrorDto, Backend, Backup, BackupProgress, BackupSizes, Cue, DeckEvent, Device, DeviceSettings, Edits, ExplorerRoot, ExportReport,
-  EditHistoryState, FilterValues, GridState, LibraryProblem, LibrarySummary, Limiter, LinkPeerSeen, LinkStatus, RelatedCriterion, RowDto, SortKey,
-  SmartRule, StickDefaults, SyncPlaylist, SyncProgress, Tick, TrackDetails, TrackField,
-  PreferencesRequest, UpdateCheck, UpdateProgress, UpdateReady, ExportProgress,
-  TrackFilter, TreeNode, ViewHandle, ViewSpec, WaveformKind,
+  DatabaseDrive, EditHistoryState, FilterValues, GridState, LibraryProblem, LibrarySummary, Limiter, LinkPeerSeen, LinkStatus, RelatedCriterion, RowDto, SortKey,
+  SelectionDetails, SmartRule, StickDefaults, SyncPlaylist, SyncProgress, Tick, TrackDetails, TrackField,
+  PreferencesRequest, RelocateSearch, UpdateCheck, UpdateProgress, UpdateReady, ExportProgress,
+  DeckId, TrackFilter, TreeNode, ViewHandle, ViewSpec, WaveformKind,
 } from "./types";
 import { TREE_ROOT } from "./types";
 import { applyEditFrom, validateEdit, isDynamicFrom, tempoX100, type EditableBeat } from "@/lib/gridEdit";
 import { toCamelot } from "@/lib/camelot";
 import { COLOR_NAMES, wholeBpm } from "@/lib/trackFilter";
 import { referenceDeviceSettings } from "./mock-device-settings";
+import { createMockDeviceLibraries } from "./mock-device-library";
 
 const ARTISTS = [
   "MORTEN", "ARTBAT", "Meduza", "Vintage Culture", "Tujamo", "UMEK", "Kryder", "Joel Corry",
@@ -310,6 +311,18 @@ function makeTree(playlistFixture: PlaylistFixture): TreeNode[] {
 
 const collator = new Intl.Collator("en", { sensitivity: "base", numeric: true });
 
+/** A detail field as a number, 0 when the row does not carry it. */
+function extraNumber(row: RowDto, field: string): number {
+  const value = row.extra?.[field];
+  return typeof value === "number" ? value : 0;
+}
+
+/** A detail field as text, empty when the row does not carry it. */
+function extraText(row: RowDto, field: string): string {
+  const value = row.extra?.[field];
+  return typeof value === "string" ? value : "";
+}
+
 function compare(a: RowDto, b: RowDto, col: SortKey): number {
   switch (col) {
     case "keyCamelot": {
@@ -325,6 +338,15 @@ function compare(a: RowDto, b: RowDto, col: SortKey): number {
     case "bpm": return a.bpmX100 - b.bpmX100;
     case "duration": return a.durationSec - b.durationSec;
     case "rating": return a.rating - b.rating;
+    case "djPlayCount": case "size": case "year": case "sampleRate": case "bitrate": case "color":
+    case "discNo": case "trackNumber": case "fileType": case "bitDepth":
+      return extraNumber(a, col) - extraNumber(b, col);
+    // Ticked first, as rekordbox's `comparePublic` orders the box.
+    case "publishTrackInfo": return Number(b.extra?.publishTrackInfo === true) - Number(a.extra?.publishTrackInfo === true);
+    case "fileName": return collator.compare(a.fileName ?? "", b.fileName ?? "");
+    case "location": case "composer": case "albumArtist": case "remixer": case "originalArtist":
+    case "mixName": case "lyricist": case "message": case "dateCreated":
+      return collator.compare(extraText(a, col), extraText(b, col));
     case "title": return collator.compare(a.title, b.title);
     case "artist": return collator.compare(a.artist, b.artist);
     case "album": return collator.compare(a.album, b.album);
@@ -355,6 +377,12 @@ export interface MockOptions {
    * turns it on for the tests that exercise an edit.
    */
   writable?: boolean;
+  /**
+   * Every how-manyth track's file is gone, from `?missing=N`, starting with
+   * the second: the Collection's `[!]` and the Missing File Manager need some.
+   * Unset, nothing is missing, as the rest of the suite expects.
+   */
+  missingEvery?: number;
 }
 
 export function createMockBackend(options: MockOptions = {}): Backend {
@@ -362,6 +390,13 @@ export function createMockBackend(options: MockOptions = {}): Backend {
   const latency = options.latencyMs ?? readLatencyFromUrl() ?? 0;
   const playlistFixture = options.playlistFixture ?? readPlaylistFixtureFromUrl();
   const all = makeRows(trackCount);
+  const missingEvery = options.missingEvery ?? readMissingFromUrl();
+  if (missingEvery !== null) {
+    for (let i = 1; i < all.length; i += missingEvery) {
+      const row = all[i];
+      if (row) row.missing = true;
+    }
+  }
   const colors = makeColors(trackCount);
   const rowPositions = new Map(all.map((row, index) => [row.id, index]));
   // What the row DTO does not carry, made up per track and edited in place.
@@ -405,8 +440,9 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     membership.get(id)?.length ?? mockPlaylistSize(id);
 
   /**
-   * Related Tracks, as the index picks them: within six percent of the
-   * track's BPM and in its key or one beside it on the wheel, the same
+   * Related Tracks, as the index picks them: within five percent of the
+   * track's BPM or of half or double it, and in its key or one beside it on
+   * the wheel, the same
    * genre added in the last thirty days, or the same artist. The track
    * itself is left out. No track, no rows.
    */
@@ -420,13 +456,23 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     };
     const together = (a: number, b: number) =>
       a >= 0 && b >= 0 && (a === b || (a ^ 1) === b || ((a & 1) === (b & 1) && ((a + 2) % 24 === b || (b + 2) % 24 === a)));
+    // rekordbox's window: 5% either side, ends rounded ties to even, at the
+    // track's tempo, half it and double it.
+    const roundEven = (x: number) => {
+      const r = Math.round(x);
+      return Math.abs(x % 1) === 0.5 && r % 2 !== 0 ? r - 1 : r;
+    };
+    const within = (centre: number, bpm: number) =>
+      bpm >= roundEven(Math.max(centre * (1 - 0.05), 0)) && bpm <= roundEven(centre * (0.05 + 1));
+    const bpmMatches = (centre: number, bpm: number) =>
+      within(centre, bpm) || within(roundEven(centre * 0.5), bpm) || within(centre * 2, bpm);
     const since = Date.parse("2026-09-18") - 30 * 86_400_000;
     return all.flatMap((row, i) => {
       if (i === at) return [];
       switch (criterion) {
         case "bpmKey": {
           if (track.bpmX100 === 0 && rank(track.key) < 0) return [];
-          if (track.bpmX100 !== 0 && Math.abs(row.bpmX100 - track.bpmX100) > track.bpmX100 * 0.06) return [];
+          if (track.bpmX100 !== 0 && !bpmMatches(track.bpmX100, row.bpmX100)) return [];
           if (rank(track.key) >= 0 && !together(rank(track.key), rank(row.key))) return [];
           return [i];
         }
@@ -438,7 +484,7 @@ export function createMockBackend(options: MockOptions = {}): Backend {
         // and key matches, as the real backend's are without one.
         case "suggestion": {
           if (track.bpmX100 === 0 && rank(track.key) < 0) return [];
-          if (track.bpmX100 !== 0 && Math.abs(row.bpmX100 - track.bpmX100) > track.bpmX100 * 0.06) return [];
+          if (track.bpmX100 !== 0 && !bpmMatches(track.bpmX100, row.bpmX100)) return [];
           if (rank(track.key) >= 0 && !together(rank(track.key), rank(row.key))) return [];
           return [i];
         }
@@ -472,7 +518,7 @@ export function createMockBackend(options: MockOptions = {}): Backend {
         }
       }
     } else if (spec.source.kind === "history") {
-      candidates = seededMembers(spec.source.id);
+      candidates = membersOf(spec.source.id).map((id) => indexOfId.get(id)).filter((i): i is number => i !== undefined);
     } else if (spec.source.kind === "tagList") {
       candidates = tagList.map((id) => indexOfId.get(id)).filter((i): i is number => i !== undefined);
     } else if (spec.source.kind === "related") {
@@ -548,6 +594,34 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     return announceHistory();
   };
 
+  /**
+   * One edit over several tracks, recorded as one step of history the way
+   * the real backend records a multiple selection's edit.
+   */
+  const recordTrackEdits = (
+    tracks: readonly string[],
+    one: (track: string) => { undo: () => void; redo: () => void },
+  ): Promise<EditHistoryState> => {
+    const steps = tracks.map(one);
+    return recordEdit({
+      label: "Track Edit",
+      undo: () => { for (const step of [...steps].reverse()) step.undo(); },
+      redo: () => { for (const step of steps) step.redo(); },
+    });
+  };
+
+  const setHasArtwork = (track: string, value: boolean) => {
+    const row = all.find((r) => r.id === track);
+    const before = row?.hasArtwork ?? false;
+    const apply = (has: boolean) => {
+      if (row) row.hasArtwork = has;
+      const detail = details.get(track);
+      if (detail) detail.hasArtwork = has;
+    };
+    apply(value);
+    return { undo: () => apply(before), redo: () => apply(value) };
+  };
+
   const findNode = (id: string) => tree.find((n) => n.id === id);
   const treeSnapshot = () => tree.map((node) => ({ ...node }));
   const restoreTree = (snapshot: readonly TreeNode[]) => {
@@ -618,11 +692,33 @@ export function createMockBackend(options: MockOptions = {}): Backend {
   /**
    * `?nolibrary` is a machine with no rekordbox library at all: nothing loads
    * until `createLibrary`, and `libraryProblem` says so.
+   * `?libraryunavailable` is rekordbox set to a library on a drive that is
+   * not connected; `useDefaultLibrary` then leaves the default folder, which
+   * is empty, to be made. `?drivelibrary` puts a library on a connected
+   * drive for Database management to list.
    */
-  let missing = readFlagFromUrl("nolibrary");
+  const defaultMasterDb = "/Users/you/Library/Pioneer/rekordbox/master.db";
+  const databaseDrives: DatabaseDrive[] = [
+    { name: "Macintosh HD", masterDb: defaultMasterDb, current: true },
+    ...(readFlagFromUrl("drivelibrary")
+      ? [{ name: "DJ SSD", masterDb: "/Volumes/DJ SSD/PIONEER/Master/master.db", current: false }]
+      : []),
+  ];
+  let problem: LibraryProblem | null = readFlagFromUrl("libraryunavailable")
+    ? { kind: "unavailable", masterDb: "/Volumes/DJ SSD/PIONEER/Master/master.db", defaultMasterDb }
+    : readFlagFromUrl("nolibrary")
+      ? { kind: "missing", masterDb: defaultMasterDb }
+      : null;
   let ready =
-    !missing && (typeof location === "undefined" || !new URLSearchParams(location.search).has("slow"));
+    problem === null && (typeof location === "undefined" || !new URLSearchParams(location.search).has("slow"));
   const readyListeners = new Set<() => void>();
+  const problemListeners = new Set<(problem: LibraryProblem) => void>();
+  /** The library is there now: the window loads it like any other start. */
+  const libraryFound = () => {
+    problem = null;
+    ready = true;
+    for (const listener of readyListeners) listener();
+  };
   if (typeof window !== "undefined") {
     (window as unknown as { __libraryReady: () => void }).__libraryReady = () => {
       ready = true;
@@ -660,6 +756,9 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       export: { tracks: 77, playlists: 3, ours: false, written: "" },
     },
   ];
+
+  // What each stick's own libraries hold, for the Devices tree.
+  const stickLibraries = createMockDeviceLibraries();
 
   // What each stick's tabs hold. DJ STICK starts empty and gains a library
   // when something is exported to it; TEST carries the rows read off the
@@ -958,7 +1057,10 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     },
     // The mock keeps no history sessions of its own to add to or take from.
     recordPlay: () => wait(generation),
-    removeFromHistory: () => bump(),
+    removeFromHistory: (history, tracks) => {
+      membership.set(history, membersOf(history).filter((t) => !tracks.includes(t)));
+      return bump();
+    },
     // The mock's rows are addressed by index, so a removal only takes the
     // tracks out of every playlist; the collection keeps its count.
     removeFromCollection: async (tracks) => {
@@ -979,43 +1081,47 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       membership.set(playlist, [...named, ...current.filter((t) => !named.includes(t))]);
       return bump();
     },
-    setTrackRating: (track, stars) => {
-      const row = all.find((r) => r.id === track);
-      const before = row?.rating ?? 0;
+    setTrackRating: (tracks, stars) => {
       const after = Math.max(0, Math.min(5, stars));
-      const apply = (value: number) => {
-        if (row) row.rating = value;
-        const detail = details.get(track);
-        if (detail) detail.rating = value;
-      };
-      apply(after);
-      return recordEdit({ label: "Track Edit", undo: () => apply(before), redo: () => apply(after) });
+      return recordTrackEdits(tracks, (track) => {
+        const row = all.find((r) => r.id === track);
+        const before = row?.rating ?? 0;
+        const apply = (value: number) => {
+          if (row) row.rating = value;
+          const detail = details.get(track);
+          if (detail) detail.rating = value;
+        };
+        apply(after);
+        return { undo: () => apply(before), redo: () => apply(after) };
+      });
     },
-    setTrackComment: (track, comment) => {
-      const row = all.find((r) => r.id === track);
-      const before = row?.comment ?? "";
-      const apply = (value: string) => {
-        if (row) row.comment = value;
-        const detail = details.get(track);
-        if (detail) detail.comment = value;
-      };
-      apply(comment);
-      return recordEdit({ label: "Track Edit", undo: () => apply(before), redo: () => apply(comment) });
-    },
-    setTrackColor: (track, color) => {
-      const at = all.findIndex((r) => r.id === track);
-      const row = all[at];
-      const before = details.get(track)?.color ?? String(colors[at] ?? 0);
-      const apply = (value: string | null) => {
-        const numeric = value === null ? 0 : Number.parseInt(value, 10);
-        if (row) row.artworkHue = numeric * 40;
-        if (at >= 0) colors[at] = numeric;
-        const detail = details.get(track);
-        if (detail) detail.color = value ?? "0";
-      };
-      apply(color);
-      return recordEdit({ label: "Track Edit", undo: () => apply(before), redo: () => apply(color) });
-    },
+    setTrackComment: (tracks, comment) =>
+      recordTrackEdits(tracks, (track) => {
+        const row = all.find((r) => r.id === track);
+        const before = row?.comment ?? "";
+        const apply = (value: string) => {
+          if (row) row.comment = value;
+          const detail = details.get(track);
+          if (detail) detail.comment = value;
+        };
+        apply(comment);
+        return { undo: () => apply(before), redo: () => apply(comment) };
+      }),
+    setTrackColor: (tracks, color) =>
+      recordTrackEdits(tracks, (track) => {
+        const at = all.findIndex((r) => r.id === track);
+        const row = all[at];
+        const before = details.get(track)?.color ?? String(colors[at] ?? 0);
+        const apply = (value: string | null) => {
+          const numeric = value === null ? 0 : Number.parseInt(value, 10);
+          if (row) row.artworkHue = numeric * 40;
+          if (at >= 0) colors[at] = numeric;
+          const detail = details.get(track);
+          if (detail) detail.color = value ?? "0";
+        };
+        apply(color);
+        return { undo: () => apply(before), redo: () => apply(color) };
+      }),
     setMyTags: (track, tags) => {
       const row = all.find((r) => r.id === track);
       const detail = row ? detailsOf(row) : undefined;
@@ -1025,60 +1131,21 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       return recordEdit({ label: "Track Edit", undo: () => apply(before), redo: () => apply(tags) });
     },
     addPlaylistArtwork: () => bump(),
-    addArtwork: (track) => {
-      const row = all.find((r) => r.id === track);
-      const before = row?.hasArtwork ?? false;
-      const apply = (value: boolean) => {
-        if (row) row.hasArtwork = value;
-        const detail = details.get(track);
-        if (detail) detail.hasArtwork = value;
-      };
-      apply(true);
-      return recordEdit({ label: "Track Edit", undo: () => apply(before), redo: () => apply(true) });
-    },
-    clearArtwork: (track) => {
-      const row = all.find((r) => r.id === track);
-      const before = row?.hasArtwork ?? false;
-      const apply = (value: boolean) => {
-        if (row) row.hasArtwork = value;
-        const detail = details.get(track);
-        if (detail) detail.hasArtwork = value;
-      };
-      apply(false);
-      return recordEdit({ label: "Track Edit", undo: () => apply(before), redo: () => apply(false) });
-    },
-    setTrackField: (track, field, value) => {
-      const row = all.find((r) => r.id === track);
-      if (!row) return bump().then(historyState);
-      const d = detailsOf(row);
-      const beforeRow = { ...row };
-      const beforeDetails = { ...d, myTags: [...d.myTags] };
-      const finish = () => {
-        const afterRow = { ...row };
-        const afterDetails = { ...d, myTags: [...d.myTags] };
-        const apply = (rowValue: RowDto, detailValue: TrackDetails) => {
-          Object.assign(row, rowValue);
-          Object.assign(d, detailValue, { myTags: [...detailValue.myTags] });
-        };
-        return recordEdit({
-          label: "Track Edit",
-          undo: () => apply(beforeRow, beforeDetails),
-          redo: () => apply(afterRow, afterDetails),
-        });
-      };
-      // The same refusals the writer makes: a number that is not one, and a
-      // key the library does not hold.
+    addArtwork: (tracks) => recordTrackEdits(tracks, (track) => setHasArtwork(track, true)),
+    clearArtwork: (tracks) => recordTrackEdits(tracks, (track) => setHasArtwork(track, false)),
+    setTrackField: (tracks, field, value) => {
+      // The same refusals the writer makes: a number that is not one, a key
+      // the library does not hold, and a title or BPM for several tracks.
+      if (tracks.length > 1 && (field === "title" || field === "bpm")) {
+        return Promise.reject(new Error(`${field} cannot be edited here.`));
+      }
       const numeric: Partial<Record<TrackField, "year" | "trackNumber" | "discNumber" | "playCount">> = {
         year: "year", trackNumber: "trackNumber", discNumber: "discNumber", playCount: "playCount",
       };
       const which = numeric[field];
-      if (which) {
-        const n = /^\s*\d+\s*$/.test(value) ? Number.parseInt(value, 10) : NaN;
-        if (!Number.isFinite(n)) {
-          return Promise.reject(new Error(`${JSON.stringify(value)} is not a whole number`));
-        }
-        d[which] = n;
-        return finish();
+      const n = /^\s*\d+\s*$/.test(value) ? Number.parseInt(value, 10) : NaN;
+      if (which && !Number.isFinite(n)) {
+        return Promise.reject(new Error(`${JSON.stringify(value)} is not a whole number`));
       }
       if (field === "key" && value !== "" && !KEYS.includes(value)) {
         return Promise.reject(new Error(`${JSON.stringify(value)} is not a key the library knows`));
@@ -1088,22 +1155,42 @@ export function createMockBackend(options: MockOptions = {}): Backend {
         if (!Number.isFinite(bpm) || bpm < 20 || bpm > 400) {
           return Promise.reject(new Error(`${JSON.stringify(value)} is not a BPM between 20 and 400`));
         }
-        row.bpmX100 = Math.round(bpm * 100);
-        d.bpmX100 = row.bpmX100;
+        const row = all.find((r) => r.id === tracks[0]);
+        if (row) {
+          row.bpmX100 = Math.round(bpm * 100);
+          detailsOf(row).bpmX100 = row.bpmX100;
+        }
         return bump().then(historyState);
       }
-      // Narrowed by hand: what is left after the numeric fields is text.
-      const text = field as Exclude<TrackField, "year" | "trackNumber" | "discNumber" | "playCount" | "bpm">;
-      d[text] = value.trim();
-      // The row carries some of the same columns; keep the two in step the
-      // way a reload of the index would.
-      if (field === "title") row.title = d.title;
-      else if (field === "artist") row.artist = d.artist;
-      else if (field === "album") row.album = d.album;
-      else if (field === "genre") row.genre = d.genre;
-      else if (field === "label") row.label = d.label;
-      else if (field === "key") row.key = d.key;
-      return finish();
+      return recordTrackEdits(tracks, (track) => {
+        const row = all.find((r) => r.id === track);
+        if (!row) return { undo: () => {}, redo: () => {} };
+        const d = detailsOf(row);
+        const beforeRow = { ...row };
+        const beforeDetails = { ...d, myTags: [...d.myTags] };
+        if (which) {
+          d[which] = n;
+        } else {
+          // Narrowed by hand: what is left after the numeric fields is text.
+          const text = field as Exclude<TrackField, "year" | "trackNumber" | "discNumber" | "playCount" | "bpm">;
+          d[text] = value.trim();
+          // The row carries some of the same columns; keep the two in step
+          // the way a reload of the index would.
+          if (field === "title") row.title = d.title;
+          else if (field === "artist") row.artist = d.artist;
+          else if (field === "album") row.album = d.album;
+          else if (field === "genre") row.genre = d.genre;
+          else if (field === "label") row.label = d.label;
+          else if (field === "key") row.key = d.key;
+        }
+        const afterRow = { ...row };
+        const afterDetails = { ...d, myTags: [...d.myTags] };
+        const apply = (rowValue: RowDto, detailValue: TrackDetails) => {
+          Object.assign(row, rowValue);
+          Object.assign(d, detailValue, { myTags: [...detailValue.myTags] });
+        };
+        return { undo: () => apply(beforeRow, beforeDetails), redo: () => apply(afterRow, afterDetails) };
+      });
     },
     addCue: (track, kind, positionMs) => {
       if (!all.some((r) => r.id === track)) return refuse(`no track ${track}`);
@@ -1413,7 +1500,7 @@ export function createMockBackend(options: MockOptions = {}): Backend {
   const deckA = {
     frames: 0, totalFrames: 0, generation: 0, playing: false, loaded: false, loadId: 0,
     tempo: 1, masterTempo: false, keyShift: 0, startInFrames: 0,
-    loopInFrames: 0, loopOutFrames: 0, looping: false,
+    loopInFrames: 0, loopOutFrames: 0, looping: false, startsAt: 0,
   };
   // Deck B holds its own tempo and key lock even though a browser has no
   // audio to apply them to: a control that snapped back on the next tick would
@@ -1421,12 +1508,53 @@ export function createMockBackend(options: MockOptions = {}): Backend {
   const deckB = {
     frames: 0, totalFrames: 0, generation: 0, playing: false, loaded: false, loadId: 0,
     tempo: 1, masterTempo: false, keyShift: 0, startInFrames: 0,
-    loopInFrames: 0, loopOutFrames: 0, looping: false,
+    loopInFrames: 0, loopOutFrames: 0, looping: false, startsAt: 0,
   };
+  /** The deck that a command names. */
+  const deckOf = (deck: DeckId) => (deck === "a" ? deckA : deckB);
+  /** The beat of the track on each deck, in seconds, or 0 for none. */
+  const deckBeat = { a: 0, b: 0 };
+  // Where each deck is, for an end-to-end test that compares the two.
+  if (typeof window !== "undefined") {
+    (window as unknown as {
+      __deckSeconds: () => {
+        a: number; b: number; beat: number; beatA: number; looping: boolean; loopingA: boolean; playingB: boolean;
+      };
+    }).__deckSeconds = () => ({
+      a: deckA.frames / SAMPLE_RATE,
+      b: deckB.frames / SAMPLE_RATE,
+      beat: deckBeat.b,
+      beatA: deckBeat.a,
+      looping: deckB.looping,
+      loopingA: deckA.looping,
+      playingB: deckB.playing,
+    });
+  }
   const deckTickListeners = new Set<(tick: Tick) => void>();
   const deckEventListeners = new Set<(event: DeckEvent) => void>();
   let clock: ReturnType<typeof setTimeout> | null = null;
   let clockAt = 0;
+
+  /*
+   * The preview player: its own clock, kept as a start time and an offset
+   * rather than a ticking timer, because nothing listens to it — the
+   * interface asks where it is.
+   */
+  const previewed = { track: null as string | null, playing: false, positionMs: 0, durationMs: 0, since: 0 };
+  const previewNow = (): number => {
+    if (!previewed.playing) return previewed.positionMs;
+    const at = previewed.positionMs + (performance.now() - previewed.since);
+    if (at < previewed.durationMs) return at;
+    // Played to the end: it stops there, as the engine's deck does.
+    previewed.playing = false;
+    previewed.positionMs = previewed.durationMs;
+    return previewed.positionMs;
+  };
+  /** Stops the preview where it is: `previewStop`, and what a deck's load or Play does. */
+  const stopPreviewed = (): void => {
+    previewed.positionMs = previewNow();
+    previewed.playing = false;
+  };
 
   /** The master level, which a browser can hold even with nothing to apply it to. */
   // −1 dB, the knob at 10: what the engine starts at.
@@ -1471,22 +1599,26 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     const step = () => {
       clock = null;
       const now = performance.now();
-      deckA.frames = Math.min(
-        deckA.frames + Math.round(((now - clockAt) / 1000) * SAMPLE_RATE),
-        deckA.totalFrames,
-      );
-      // Inside a loop the head rounds at the out point, as the deck does.
-      if (deckA.looping && deckA.loopOutFrames > deckA.loopInFrames && deckA.frames >= deckA.loopOutFrames) {
-        deckA.frames = deckA.loopInFrames + ((deckA.frames - deckA.loopOutFrames) % (deckA.loopOutFrames - deckA.loopInFrames));
+      for (const deck of [deckA, deckB]) {
+        if (!deck.playing) continue;
+        // A held start (see `deckPlayAfter`) or a move counts from then, not from the last step.
+        const from = Math.max(clockAt, deck.startsAt);
+        if (now <= from) continue;
+        deck.frames = Math.min(deck.frames + Math.round(((now - from) / 1000) * SAMPLE_RATE), deck.totalFrames);
+        // Inside a loop the head rounds at the out point, as the deck does.
+        if (deck.looping && deck.loopOutFrames > deck.loopInFrames && deck.frames >= deck.loopOutFrames) {
+          deck.frames = deck.loopInFrames + ((deck.frames - deck.loopOutFrames) % (deck.loopOutFrames - deck.loopInFrames));
+        }
+        if (deck.frames >= deck.totalFrames) deck.playing = false;
       }
       clockAt = now;
-      if (deckA.frames >= deckA.totalFrames) deckA.playing = false;
       sendTick();
-      if (deckA.playing) clock = setTimeout(step, TICK_MS);
+      if (deckA.playing || deckB.playing) clock = setTimeout(step, TICK_MS);
     };
     clock = setTimeout(step, TICK_MS);
   };
 
+  const importListeners = new Set<(progress: ExportProgress) => void>();
   const wait = <T>(value: T): Promise<T> =>
     latency > 0 ? new Promise((r) => setTimeout(() => r(value), latency)) : Promise.resolve(value);
 
@@ -1590,6 +1722,27 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       // answer before the library is up. A mock that served rows while the
       // summary was still failing would not be standing in for anything.
       if (!ready) return notReady();
+      if (spec.source.kind === "device") {
+        const q = fold(spec.query.trim());
+        let rows: RowDto[];
+        try {
+          rows = stickLibraries.rows(spec.source.path, spec.source.format, spec.source.playlist)
+            .filter((row) => q === "" || matchesSearch(row, q, spec.searchField ?? "all"));
+        } catch (error) {
+          return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+        }
+        if (spec.sort !== "trackNo") {
+          rows.sort((x, y) => {
+            const c = compare(x, y, spec.sort);
+            return spec.descending ? -c : c;
+          });
+        } else if (spec.descending) {
+          rows.reverse();
+        }
+        const viewId = nextViewId++;
+        folderViews.set(viewId, rows);
+        return wait<ViewHandle>({ viewId, len: rows.length, gen: 1 });
+      }
       if (spec.source.kind === "folder") {
         const folder = spec.source.path;
         const q = fold(spec.query.trim());
@@ -1830,11 +1983,10 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     // No filesystem in a browser, so nothing is written — but the counts are
     // answered so the device panel's reporting can be driven end to end.
     exportPlaylist: (playlistId, destination, defaults, deleteUnlistedMusic) => {
-      if (destination === undefined) return wait(null);
       const device = devices.find((d) => d.path === destination);
       if (!device) {
-        // The counts are still answered for a folder picked by hand: a
-        // browser has no picker, so the panel's flow is what is driven.
+        // The counts are still answered for a path no mock stick is at, so
+        // a script's export can be driven end to end.
         const tracks = playlistSize(playlistId);
         return wait({
           tracks, playlists: 1, bytesCopied: tracks * 8_000_000, analysisFiles: tracks,
@@ -1902,7 +2054,7 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     },
     validateExportFiles: () => wait([]),
     smartRule: (playlist) => wait(smartRules.get(playlist) ?? { logic: "all", conditions: [] }),
-    importUsb: () => Promise.resolve({ tracks: 0, histories: 0, settings: 0, skipped: 0 }),
+    importUsb: () => Promise.resolve({ tracks: 0, histories: 0, settings: 0, skipped: 0, unchanged: 0 }),
     ejectDevice: async (path) => {
       const index = devices.findIndex(device => device.path === path);
       if (index < 0) throw new Error("That device is no longer connected.");
@@ -1930,6 +2082,7 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     // One device, so the panel has something to show. A browser cannot see a
     // real volume; the app asks the OS.
     listDevices: () => wait(devices.map((device) => ({ ...device, fileSystem: "FAT32" }))),
+    onImportProgress: (listener) => { importListeners.add(listener); return () => { importListeners.delete(listener); }; },
     onExportProgress: (listener) => { exportListeners.add(listener); return () => { exportListeners.delete(listener); }; },
     exportProgress: () => wait([...exportJobs.values()]),
     cancelExport: (path) => { cancelledExports.add(path); return Promise.resolve(); },
@@ -1979,8 +2132,31 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       if (!backups.delete(path)) return notFound("Backup not found.");
       return wait(undefined);
     },
-    // A browser cannot ask; the answer is yes, so the flow can be driven.
-    confirm: () => Promise.resolve(true),
+    // A browser cannot ask; the answer is yes, so the flow can be driven. A
+    // test sets `window.__confirmAnswer = false` to answer Cancel instead, and
+    // reads what was asked from `window.__confirmed`.
+    // `window.__confirmTitles` keeps each question's title, and
+    // `window.__confirmAnswers`, when set, answers question by question.
+    confirm: (message, labels) => {
+      const page = window as unknown as {
+        __confirmAnswer?: boolean;
+        __confirmAnswers?: boolean[];
+        __confirmed?: string[];
+        __confirmTitles?: (string | null)[];
+        __confirmLabels?: (string | null)[];
+      };
+      (page.__confirmed ??= []).push(message);
+      (page.__confirmTitles ??= []).push(labels?.title ?? null);
+      (page.__confirmLabels ??= []).push(labels ? `${labels.yes}/${labels.no}` : null);
+      const queued = page.__confirmAnswers?.shift();
+      return Promise.resolve(queued ?? page.__confirmAnswer ?? true);
+    },
+    // A message box: what it said, in `window.__told`, as "title: text".
+    tell: (message, title) => {
+      const page = window as unknown as { __told?: string[] };
+      (page.__told ??= []).push(`${title}: ${message}`);
+      return wait(undefined);
+    },
 
     // A deck that keeps time but makes no sound. The audio engine is Rust and
     // is not here, so this counts frames and emits the same ticks the engine
@@ -1988,21 +2164,26 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     // readouts — then behaves in a browser exactly as it does in the app, and
     // can be tested. What a browser cannot do is make a noise.
     deckLoad: (deck, trackId, loadId) => {
-      if (deck !== "a") return wait(undefined);
+      // A deck load stops the preview, as the app's does (#242).
+      stopPreviewed();
+      const d = deckOf(deck);
       const index = Number.parseInt(trackId, 10) - 100000;
       const row = all[index];
-      deckA.frames = 0;
-      deckA.totalFrames = row ? row.durationSec * SAMPLE_RATE : 0;
-      deckA.playing = false;
-      deckA.loaded = row !== undefined;
-      deckA.loadId = row === undefined ? 0 : loadId;
-      deckA.generation += 1;
-      stopClock();
+      // A missing file is refused before the deck changes, as the app's is.
+      if (row?.missing === true) return notFound("Load error. The file could not be found.");
+      d.frames = 0;
+      d.totalFrames = row ? row.durationSec * SAMPLE_RATE : 0;
+      deckBeat[deck] = row && row.bpmX100 > 0 ? 6000 / row.bpmX100 : 0;
+      d.playing = false;
+      d.loaded = row !== undefined;
+      d.loadId = row === undefined ? 0 : loadId;
+      d.generation += 1;
+      if (!deckA.playing && !deckB.playing) stopClock();
       for (const listener of deckEventListeners) {
         listener({
-          deck: "a",
+          deck,
           loadId,
-          totalFrames: deckA.totalFrames,
+          totalFrames: d.totalFrames,
           sampleRate: SAMPLE_RATE,
           message: row ? null : "That track's file could not be found.",
         });
@@ -2010,78 +2191,120 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       sendTick();
       return wait(undefined);
     },
-    deckUnload: () => {
-      deckA.loaded = false;
-      deckA.playing = false;
-      deckA.frames = 0;
-      deckA.loadId = 0;
-      stopClock();
+    deckUnload: (deck) => {
+      const d = deckOf(deck);
+      d.loaded = false;
+      d.playing = false;
+      d.frames = 0;
+      d.loadId = 0;
+      if (!deckA.playing && !deckB.playing) stopClock();
       sendTick();
       return wait(undefined);
     },
-    deckPlay: () => {
-      if (!deckA.loaded) return wait(undefined);
-      deckA.playing = true;
+    deckPlay: (deck) => {
+      // A deck that plays stops the preview, as the app's does (#242).
+      stopPreviewed();
+      const d = deckOf(deck);
+      if (!d.loaded) return wait(undefined);
+      d.playing = true;
+      // From now, not from the clock's last step: a deck that starts between
+      // two steps has not been playing since the earlier one.
+      d.startsAt = performance.now();
       startClock();
       return wait(undefined);
     },
     // The wait is a timer here rather than counted in output frames: a
     // browser has no callback to count them in, and the timing is only
     // ever judged by ear against a real device.
-    deckPlayAfter: (_deck, delayMs) => {
-      if (!deckA.loaded) return wait(undefined);
-      deckA.playing = true;
-      setTimeout(startClock, Math.max(0, delayMs));
+    deckPlayAfter: (deck, delayMs) => {
+      stopPreviewed();
+      const d = deckOf(deck);
+      if (!d.loaded) return wait(undefined);
+      d.playing = true;
+      d.startsAt = performance.now() + Math.max(0, delayMs);
+      startClock();
       return wait(undefined);
     },
-    deckPause: () => {
-      deckA.playing = false;
-      stopClock();
+    deckPause: (deck) => {
+      const d = deckOf(deck);
+      d.playing = false;
+      if (!deckA.playing && !deckB.playing) stopClock();
       sendTick();
       return wait(undefined);
     },
-    deckSeek: (_deck, positionMs) => {
-      deckA.frames = Math.max(-5 * SAMPLE_RATE, Math.round((positionMs / 1000) * SAMPLE_RATE));
-      deckA.generation += 1;
+    deckSeek: (deck, positionMs) => {
+      const d = deckOf(deck);
+      d.frames = Math.max(-5 * SAMPLE_RATE, Math.round((positionMs / 1000) * SAMPLE_RATE));
+      d.generation += 1;
+      d.startsAt = Math.max(d.startsAt, performance.now());
       sendTick();
       return wait(undefined);
     },
-    deckSetLoop: (_deck, inMs, outMs) => {
+    deckMove: (deck, byMs) => {
+      const d = deckOf(deck);
+      d.frames = Math.max(-5 * SAMPLE_RATE, d.frames + Math.round((byMs / 1000) * SAMPLE_RATE));
+      d.generation += 1;
+      sendTick();
+      return wait(undefined);
+    },
+    deckSetLoop: (deck, inMs, outMs) => {
+      const d = deckOf(deck);
       const from = Math.max(0, Math.round((inMs / 1000) * SAMPLE_RATE));
       const to = Math.max(0, Math.round((outMs / 1000) * SAMPLE_RATE));
       if (to <= from) return wait(undefined);
-      deckA.loopInFrames = from;
-      deckA.loopOutFrames = to;
-      deckA.looping = true;
-      if (deckA.frames >= to || deckA.frames < from) {
-        deckA.frames = from;
-        deckA.generation += 1;
+      d.loopInFrames = from;
+      d.loopOutFrames = to;
+      d.looping = true;
+      if (d.frames >= to || d.frames < from) {
+        d.frames = from;
+        d.generation += 1;
+        d.startsAt = Math.max(d.startsAt, performance.now());
       }
       sendTick();
       return wait(undefined);
     },
-    deckLoopActive: (_deck, on) => {
-      if (deckA.loopOutFrames <= deckA.loopInFrames) return wait(undefined);
-      deckA.looping = on;
+    deckLoopActive: (deck, on) => {
+      const d = deckOf(deck);
+      if (d.loopOutFrames <= d.loopInFrames) return wait(undefined);
+      if (!on && d.looping && d.playing) {
+        // The clock only steps ten times a second, but the deck wraps at the
+        // out point the moment it gets there. Brought up to now first, so an
+        // exit after the out point leaves the head where the deck had
+        // wrapped it to, not past the end of the loop.
+        const now = performance.now();
+        const from = Math.max(clockAt, d.startsAt);
+        if (now > from) {
+          d.frames += Math.round(((now - from) / 1000) * SAMPLE_RATE);
+          if (d.frames >= d.loopOutFrames) {
+            d.frames = d.loopInFrames + ((d.frames - d.loopOutFrames) % (d.loopOutFrames - d.loopInFrames));
+          }
+          d.startsAt = now;
+        }
+      }
+      d.looping = on;
       if (on) {
-        deckA.frames = deckA.loopInFrames;
-        deckA.generation += 1;
+        d.frames = d.loopInFrames;
+        d.generation += 1;
+        d.startsAt = Math.max(d.startsAt, performance.now());
       }
       sendTick();
       return wait(undefined);
     },
-    deckClearLoop: () => {
-      deckA.loopInFrames = 0;
-      deckA.loopOutFrames = 0;
-      deckA.looping = false;
+    deckClearLoop: (deck) => {
+      const d = deckOf(deck);
+      d.loopInFrames = 0;
+      d.loopOutFrames = 0;
+      d.looping = false;
       sendTick();
       return wait(undefined);
     },
     // A browser has no audio, so a drag is a seek that follows the pointer:
     // the position moves, nothing is heard, and the visuals are the same.
     deckScrubBegin: () => wait(undefined),
-    deckScrubTo: (_deck, positionMs) => {
-      deckA.frames = Math.max(-5 * SAMPLE_RATE, Math.round((positionMs / 1000) * SAMPLE_RATE));
+    deckScrubTo: (deck, positionMs) => {
+      const d = deckOf(deck);
+      d.frames = Math.max(-5 * SAMPLE_RATE, Math.round((positionMs / 1000) * SAMPLE_RATE));
+      d.startsAt = Math.max(d.startsAt, performance.now());
       sendTick();
       return wait(undefined);
     },
@@ -2103,6 +2326,7 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     checkForUpdate: () =>
       wait<UpdateCheck>({
         ready: updateReady,
+        storeInstall: false,
         currentVersion: "0.4.0",
         version: "0.6.0",
         date: "2026-09-12T18:00:00Z",
@@ -2190,6 +2414,7 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       return wait(undefined);
     },
     deckMetronome: () => wait(undefined),
+    setMetronomeGrid: () => wait(undefined),
     deckKeyShift: (deck, semitones) => {
       (deck === "b" ? deckB : deckA).keyShift = Math.max(-12, Math.min(12, Math.round(semitones)));
       sendTick();
@@ -2202,8 +2427,8 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     setChannelTrim: () => wait(undefined),
     setCrossfade: () => wait(undefined),
     setEqCurve: () => wait(undefined),
-    deckScrubEnd: () => {
-      deckA.generation += 1;
+    deckScrubEnd: (deck) => {
+      deckOf(deck).generation += 1;
       sendTick();
       return wait(undefined);
     },
@@ -2221,6 +2446,33 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       }),
 
     deckState: () => wait(tick()),
+    previewPlay: (trackId, positionMs) => {
+      const row = all[Number.parseInt(trackId, 10) - 100000];
+      if (!row) return notFound("That track's file could not be found.");
+      // rekordbox outside PERFORMANCE mode pauses the decks for a preview.
+      if (deckA.playing || deckB.playing) {
+        deckA.playing = false;
+        deckB.playing = false;
+        stopClock();
+        sendTick();
+      }
+      previewed.track = trackId;
+      previewed.durationMs = row.durationSec * 1000;
+      previewed.positionMs = Math.min(Math.max(0, positionMs), previewed.durationMs);
+      previewed.since = performance.now();
+      previewed.playing = previewed.positionMs < previewed.durationMs;
+      return wait(undefined);
+    },
+    previewStop: () => {
+      stopPreviewed();
+      return wait(undefined);
+    },
+    previewState: () => {
+      const positionMs = previewNow();
+      return wait({
+        track: previewed.track, playing: previewed.playing, positionMs, durationMs: previewed.durationMs,
+      });
+    },
     onDeckTick: (listener) => {
       deckTickListeners.add(listener);
       return () => deckTickListeners.delete(listener);
@@ -2238,16 +2490,30 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       readyListeners.add(listener);
       return () => readyListeners.delete(listener);
     },
-    onLibraryProblem: () => () => undefined,
-    libraryProblem: () =>
-      wait<LibraryProblem | null>(
-        missing ? { kind: "missing", masterDb: "/Users/you/Library/Pioneer/rekordbox/master.db" } : null,
-      ),
+    onLibraryProblem: (listener) => {
+      problemListeners.add(listener);
+      return () => problemListeners.delete(listener);
+    },
+    libraryProblem: () => wait<LibraryProblem | null>(problem),
     createLibrary: async () => {
       await wait(undefined);
-      missing = false;
-      ready = true;
-      for (const listener of readyListeners) listener();
+      libraryFound();
+    },
+    useDefaultLibrary: async () => {
+      await wait(undefined);
+      // The default folder is empty here, so it is offered to be made, as
+      // the real backend's next look reports.
+      problem = { kind: "missing", masterDb: defaultMasterDb };
+      for (const listener of problemListeners) listener({ ...problem });
+    },
+    databaseDrives: () => wait(databaseDrives.map((drive) => ({ ...drive }))),
+    switchLibrary: async (masterDb) => {
+      await wait(undefined);
+      if (!databaseDrives.some((drive) => drive.masterDb === masterDb)) {
+        throw new Error(`${masterDb} is not a master.db`);
+      }
+      // The real app starts again on it; the mock marks it open.
+      for (const drive of databaseDrives) drive.current = drive.masterDb === masterDb;
     },
 
     // A browser has no native menu bar. The mock exposes the listener so a
@@ -2325,6 +2591,13 @@ export function createMockBackend(options: MockOptions = {}): Backend {
             if (settings?.key !== false) row.key ||= "Am";
             // As the shell says it: a deck showing the track redraws.
             for (const listener of analysisListeners) listener(trackId);
+            const firstBeatMs = settings?.bpmGrid !== false && settings?.firstBeatCue
+              ? gridOf(trackId)?.beats[0]?.timeMs : undefined;
+            const cues = cuesOf(trackId);
+            if (firstBeatMs !== undefined && !cues.some(cue => cue.memory && Math.abs(cue.positionMs - firstBeatMs) <= 5)) {
+              cues.push({ id: `cue-${nextCueId++}`, positionMs: firstBeatMs, outMs: 0, letter: "", memory: true, colour: null });
+              void cuesChanged(trackId, null);
+            }
             resolve({
             trackId,
             analysed: row.analysed,
@@ -2345,8 +2618,49 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     // No picker in a browser, so nothing can be chosen to import or written.
     importFiles: () => wait(null),
     importFolder: () => wait(null),
-    importPaths: (paths) => wait({ imported: 0, skipped: paths.map((p) => `${p}: the mock library takes no files`), tracks: [] }),
-    importXml: () => wait(null),
+    importPaths: (paths) => wait({ imported: 0, skipped: paths.map((p) => `${p}: the mock library takes no files`), tracks: [], existing: [] }),
+    // Emits progress, then holds until `window.__finishImport()` so a test
+    // can watch the status line while an import is still running. A test
+    // sets `window.__xmlSameNamed` to the lists the file would replace: the
+    // mock then asks first, as the real backend's caller does, and
+    // `window.__xmlImportStarted` says whether anything was imported.
+    importXml: async (confirmReplace) => {
+      const page = window as unknown as { __xmlSameNamed?: string[]; __xmlImportStarted?: boolean };
+      const sameNamed = page.__xmlSameNamed ?? [];
+      if (sameNamed.length > 0 && !(await confirmReplace(sameNamed))) return null;
+      page.__xmlImportStarted = true;
+      const emit = (done: number) => importListeners.forEach((listener) =>
+        listener({ path: "", state: "copying", done, total: 3, title: "" }));
+      emit(0);
+      emit(1);
+      await new Promise<void>((resolve) => {
+        (window as unknown as { __finishImport?: () => void }).__finishImport = resolve;
+      });
+      return null;
+    },
+    // No file system in a browser: a path without an extension stands for a
+    // folder, which becomes an empty playlist the way a real drop names one.
+    // Every folder of one drop goes to the drop's one insert index, as in
+    // the real backend (rekordbox's createNewList), so a later folder lands
+    // before an earlier one.
+    importFolderPlaylist: async (path, parent, replace, given) => {
+      const name = path.split(/[\\/]/).filter(Boolean).pop() ?? "";
+      const report = { name, playlist: null, conflict: null, folder: false, imported: 0, skipped: [], tracks: [], existing: 0, at: given ?? null };
+      if (!name || /\.[a-z0-9]+$/i.test(name)) return wait(report);
+      const siblings = childrenOf(parent);
+      let at = given ?? siblings.length;
+      const clash = siblings.find((n) => n.name === name);
+      if (clash && clash.id !== replace) return wait({ ...report, folder: true, conflict: clash.id, at });
+      if (clash) {
+        if (siblings.indexOf(clash) < at) at -= 1;
+        await edits.deletePlaylist(clash.id);
+      }
+      const before = new Set(tree.map((n) => n.id));
+      await edits.createPlaylist(name, parent);
+      const made = tree.find((n) => !before.has(n.id))?.id ?? null;
+      if (made && childrenOf(parent).findIndex((n) => n.id === made) !== at) await edits.movePlaylist(made, parent, at);
+      return wait({ ...report, folder: true, playlist: made, at });
+    },
     exportLoopWav: () => wait(null),
     importItunes: () => wait(null),
     itunesDefaultLibrary: () => wait({
@@ -2366,9 +2680,43 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     exportPlaylistFile: () => wait(null),
     exportXml: () => wait(null),
 
-    // Nothing in the mock has a file behind it, so nothing can be missing and
-    // there is no picker to choose one with.
-    missingTracks: () => wait({ total: 0, tracks: [] }),
+    // The tracks `?missing=N` took the files of, in collection order.
+    missingTracks: (offset, limit) => {
+      const gone = all.filter((row) => row.missing === true);
+      return wait({
+        total: gone.length,
+        tracks: gone.slice(offset, offset + limit).map((row) => ({
+          id: row.id,
+          title: row.title,
+          artist: row.artist,
+          album: row.album,
+          path: String(row.extra?.location ?? ""),
+        })),
+      });
+    },
+    removeMissingTracks: async (tracks) => {
+      const gone = all.filter((row) => row.missing === true && (tracks === null || tracks.includes(row.id)));
+      const ids = gone.map((row) => row.id);
+      for (const [playlist, members] of membership) {
+        membership.set(playlist, members.filter((t) => !ids.includes(t)));
+      }
+      // The mock's collection is fixed, so a deleted track stays listed but
+      // stops being missing; the manager's list is what shows the change.
+      for (const row of gone) delete row.missing;
+      if (ids.length > 0) await bump(false);
+      return ids.length;
+    },
+    // The unanalysed rows whose file is there; `?missing=N` takes files away.
+    unanalysedTracks: (from, limit) => {
+      const tracks: { id: string; title: string }[] = [];
+      for (let index = from; index < all.length; index += 1) {
+        const row = all[index];
+        if (!row || row.analysed !== 0 || row.missing === true) continue;
+        if (tracks.length === limit) return wait({ tracks, next: index });
+        tracks.push({ id: row.id, title: row.title });
+      }
+      return wait({ tracks, next: null });
+    },
     // The mock's titles are drawn from a short list, so the same title under
     // the same artist comes up as it does in a real library.
     findDuplicates: (limit) => {
@@ -2388,9 +2736,64 @@ export function createMockBackend(options: MockOptions = {}): Backend {
         })),
       });
     },
-    relocateTrack: () => wait(null),
-    // No files behind the rows, so nothing is missing and nothing moves.
-    autoRelocate: () => wait({ relocated: 0, unresolved: 0 }),
+    // No picker in a browser: the chooser answers with the track's own file
+    // name under a fixed folder, or with `window.__relocatePicks` in turn
+    // (null is a cancel). What it was asked is kept in
+    // `window.__relocateChooser` as "title | folder".
+    chooseRelocateFile: (title, fileName, folder) => {
+      const page = window as unknown as { __relocatePicks?: (string | null)[]; __relocateChooser?: string[] };
+      (page.__relocateChooser ??= []).push(`${title} | ${folder ?? ""}`);
+      const queued = page.__relocatePicks?.shift();
+      return wait(queued !== undefined ? queued : `/Users/mock/Music/Moved/${fileName}`);
+    },
+    // A file another row of the collection already has is refused, as
+    // rekordbox refuses it; anything else stops the track being missing.
+    relocateTrack: async (trackId, path) => {
+      const row = all.find((r) => r.id === trackId);
+      const taken = all.some((r) => r.id !== trackId && r.missing !== true && String(r.extra?.location ?? "") === path);
+      if (taken) return false;
+      if (row?.missing === true) {
+        delete row.missing;
+        await bump();
+      }
+      return true;
+    },
+    relocationTargets: (tracks) => {
+      const wanted = tracks.slice(0, 128);
+      return wait(wanted
+        .map((id) => all.find((row) => row.id === id))
+        .filter((row): row is RowDto => row?.missing === true)
+        .map((row) => ({
+          id: row.id,
+          title: row.title,
+          artist: row.artist,
+          album: row.album,
+          path: String(row.extra?.location ?? ""),
+        })));
+    },
+    // The new folder holds every missing file named: each is found.
+    // `window.__relocatedBy` keeps "from -> to".
+    relocateByLocation: async (tracks, from, to) => {
+      const page = window as unknown as { __relocatedBy?: string[] };
+      (page.__relocatedBy ??= []).push(`${from} -> ${to}`);
+      const found = all.filter((row) => row.missing === true && tracks.includes(row.id));
+      for (const row of found) delete row.missing;
+      if (found.length > 0) await bump();
+      return found.length;
+    },
+    // The search folders hold every other missing file, in list order, so a
+    // run both relocates and leaves some unresolved; with no folder ticked
+    // nothing is found. `window.__relocateSearch` keeps what was searched.
+    autoRelocate: async (search, tracks) => {
+      const page = window as unknown as { __relocateSearch?: RelocateSearch[] };
+      (page.__relocateSearch ??= []).push(search);
+      const searched = search.folders.length > 0 || search.music || search.video || search.desktop;
+      const gone = all.filter((row) => row.missing === true && (tracks === null || tracks.includes(row.id)));
+      const found = searched ? gone.filter((_, at) => at % 2 === 0) : [];
+      for (const row of found) delete row.missing;
+      if (found.length > 0) await bump();
+      return { relocated: found.length, unresolved: gone.length - found.length };
+    },
     // No dialogs in a browser: the folder is a fixed one, so the search
     // folders list can be driven end to end.
     pickFolder: () => wait("/Users/mock/Music/Moved"),
@@ -2430,6 +2833,7 @@ export function createMockBackend(options: MockOptions = {}): Backend {
         hasOneLibrary: true,
         hasLibrarySettings: true,
         hasDevSetting: true,
+        deviceLibraryBackgroundColorType: current.deviceLibraryBackgroundColorType ?? 0,
         waveformColor: defaults?.waveformColor ?? current.waveformColor,
         waveformPosition: defaults?.waveformPosition ?? current.waveformPosition,
         overviewWaveform: defaults?.overviewWaveform ?? current.overviewWaveform,
@@ -2533,6 +2937,14 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       return () => analysisListeners.delete(listener);
     },
     // The fake disk above. Copies, as with the tree: the map is the mock's.
+    deviceLibraries: (path) => wait(stickLibraries.libraries(path)),
+    devicePlaylistEdit: (path, format, edit) => {
+      try {
+        return wait(stickLibraries.edit(path, format, edit));
+      } catch (error) {
+        return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    },
     explorerRoots: () => wait(EXPLORER_ROOTS.map((root) => ({ ...root }))),
     explorerChildren: (path) => {
       const names = [...(EXPLORER_CHILDREN.get(path) ?? [])];
@@ -2552,6 +2964,23 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       if (!row) return Promise.reject(new Error("That track is no longer in the library."));
       // A copy: the panel must not be able to edit the backend's own record.
       return wait({ ...detailsOf(row) });
+    },
+    selectionDetails: (trackIds) => {
+      if (!ready) return notReady();
+      const rows = trackIds.flatMap((id) => all.filter((r) => r.id === id));
+      const [head] = rows;
+      if (!head) return Promise.reject(new Error("That track is no longer in the library."));
+      const first = detailsOf(head);
+      const others = rows.slice(1).map(detailsOf);
+      // Every field but the id and the My Tags, as the real backend compares.
+      const compared = (Object.keys(first) as (keyof TrackDetails)[])
+        .filter((key) => key !== "id" && key !== "myTags" && key !== "hasArtwork");
+      const mixed: SelectionDetails["mixed"] = compared.filter((key) =>
+        others.some((other) => other[key] !== first[key]),
+      );
+      // The mock serves a different picture for each track that has one.
+      if (rows.length > 1 && rows.some((r) => r.hasArtwork)) mixed.push("artwork");
+      return wait({ first: { ...first, myTags: [...first.myTags] }, count: rows.length, mixed });
     },
     trackLookups: () =>
       wait({
@@ -2590,6 +3019,13 @@ function readLinkFromUrl(): "detected" | "on" | "blocked" | null {
 }
 
 /** `?tracks=40000` lets the perf spec load a full-size library into the mock. */
+function readMissingFromUrl(): number | null {
+  if (typeof location === "undefined") return null;
+  const raw = new URLSearchParams(location.search).get("missing");
+  const n = raw ? Number.parseInt(raw, 10) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
 function readCountFromUrl(): number | null {
   if (typeof location === "undefined") return null;
   const raw = new URLSearchParams(location.search).get("tracks");

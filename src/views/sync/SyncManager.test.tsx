@@ -10,7 +10,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { __setBackend } from "@/ipc/client";
+import { __setBackend, getBackend } from "@/ipc/client";
 import type { Backend, Device, DeviceSyncState, ItunesLibrary, SyncDeviceReport, SyncProgress, TreeNode, ExportProgress } from "@/ipc/types";
 import { SyncManager } from "./SyncManager";
 import { PreferencesProvider } from "@/store/usePreferences";
@@ -58,6 +58,9 @@ const report = (path: string, tracks: number): SyncDeviceReport => ({
 let host: HTMLDivElement;
 let root: Root;
 let devicesChanged: (() => void) | undefined;
+let libraryChanged: (() => void) | undefined;
+let tree: TreeNode[];
+let readTree: () => Promise<TreeNode[]>;
 let listDevices: ReturnType<typeof vi.fn>;
 let importUsb: ReturnType<typeof vi.fn>;
 let syncDevices: ReturnType<typeof vi.fn>;
@@ -87,6 +90,9 @@ const status = () => host.querySelector('[role="status"]')?.textContent ?? "";
 beforeEach(async () => {
   cancelExport.mockClear();
   devicesChanged = undefined;
+  libraryChanged = undefined;
+  tree = TREE;
+  readTree = () => Promise.resolve(tree.map((n) => ({ ...n })));
   listDevices = vi.fn(() => Promise.resolve(DEVICES.map(d => ({ ...d }))));
   globalThis.IS_REACT_ACT_ENVIRONMENT = true;
   progress = null;
@@ -103,7 +109,11 @@ beforeEach(async () => {
   importItunesSelected = vi.fn(() => Promise.resolve({ imported: 5, existing: 0, skipped: [], playlists: 1, cues: 0, tracks: [] }));
   __setBackend({
     librarySummary: () => Promise.resolve({ trackCount: 3, playlistCount: 3, readOnly: rekordboxOpen, dbVersion: 6000 }),
-    playlistTree: () => Promise.resolve(TREE.map((n) => ({ ...n }))),
+    playlistTree: () => readTree(),
+    onLibraryChanged: (listener: () => void) => {
+      libraryChanged = listener;
+      return () => { libraryChanged = undefined; };
+    },
     itunesDefaultLibrary: () => Promise.resolve(itunesLibrary),
     chooseItunesLibrary: () => Promise.resolve(null),
     importItunesSelected,
@@ -324,6 +334,100 @@ describe("SyncManager", () => {
     expect(syncDevices.mock.calls[0]?.[0]).toEqual(["s1"]);
   });
 
+  it("sends an intelligent playlist with the folder it is in", async () => {
+    click(box("Sets"));
+    expect(box("Peak Time")?.checked).toBe(true);
+    click(box("USB B"));
+    await settle();
+    click(host.querySelector<HTMLButtonElement>('button[aria-label="SYNC"]'));
+    await settle();
+    expect(syncDevices.mock.calls[0]?.[0]).toEqual(["p1", "p2", "s1"]);
+  });
+
+  it("follows library changes while open, keeping ticks on playlists still there", async () => {
+    click(box("Warm Up"));
+    click(box("Closing"));
+    tree = [...TREE.filter((n) => n.id !== "p3").slice(0, 6), { id: "p4", name: "New Playlist", kind: "playlist", depth: 1 }, ...TREE.slice(7)];
+    act(() => libraryChanged?.());
+    await settle();
+
+    const names = [...host.querySelectorAll('[aria-label="Playlists"] > [role="treeitem"]')].map((row) => row.textContent?.trim());
+    expect(names).toEqual(["Sets", "Warm Up", "Main Set", "Peak Time", "New Playlist"]);
+    expect(box("Warm Up")?.checked).toBe(true);
+    expect(host.textContent).toContain("1 of 4 playlists selected");
+  });
+
+  it("keeps open and closed folders as they were across a re-read", async () => {
+    act(() => root.unmount());
+    const nested: TreeNode[] = [
+      ...TREE.slice(0, 3),
+      { id: "f2", name: "Archive", kind: "folder", depth: 2 },
+      { id: "p5", name: "Old Set", kind: "playlist", depth: 3 },
+      ...TREE.slice(3, 7),
+      { id: "f3", name: "Gigs", kind: "folder", depth: 1 },
+      { id: "p6", name: "Friday", kind: "playlist", depth: 2 },
+      ...TREE.slice(7),
+    ];
+    tree = nested;
+    root = createRoot(host);
+    act(() => root.render(<SyncManager onClose={onClose} />));
+    await settle();
+    const names = () => [...host.querySelectorAll('[aria-label="Playlists"] > [role="treeitem"]')].map((row) => row.textContent?.trim());
+    // Top folders open; deeper ones start closed.
+    expect(names()).toEqual(["Sets", "Archive", "Warm Up", "Main Set", "Peak Time", "Closing", "Gigs", "Friday"]);
+
+    click(host.querySelector<HTMLButtonElement>('button[aria-label="Expand Archive"]'));
+    click(host.querySelector<HTMLButtonElement>('button[aria-label="Collapse Gigs"]'));
+    expect(names()).toEqual(["Sets", "Archive", "Old Set", "Warm Up", "Main Set", "Peak Time", "Closing", "Gigs"]);
+
+    // A new nested folder starts closed; the folders already seen stay as the user left them.
+    tree = [
+      ...nested.slice(0, 8),
+      { id: "f4", name: "Later", kind: "folder", depth: 2 },
+      { id: "p7", name: "Encore", kind: "playlist", depth: 3 },
+      ...nested.slice(8),
+    ];
+    act(() => libraryChanged?.());
+    await settle();
+    expect(names()).toEqual(["Sets", "Archive", "Old Set", "Warm Up", "Main Set", "Peak Time", "Later", "Closing", "Gigs"]);
+    expect(host.querySelector('[role="treeitem"][aria-expanded="true"] input[aria-label="Archive"]')).not.toBeNull();
+    expect(host.querySelector('[role="treeitem"][aria-expanded="false"] input[aria-label="Gigs"]')).not.toBeNull();
+    expect(host.querySelector('[role="treeitem"][aria-expanded="false"] input[aria-label="Later"]')).not.toBeNull();
+  });
+
+  it("ignores a playlist read that answers after a newer one", async () => {
+    const held: { resolve: (tree: TreeNode[]) => void; reject: (error: Error) => void }[] = [];
+    readTree = () => new Promise((resolve, reject) => { held.push({ resolve, reject }); });
+    const stale = [...TREE.slice(0, 7), { id: "p4", name: "Stale Playlist", kind: "playlist" as const, depth: 1 }, ...TREE.slice(7)];
+    const fresh = [...TREE.slice(0, 7), { id: "p5", name: "Fresh Playlist", kind: "playlist" as const, depth: 1 }, ...TREE.slice(7)];
+    const names = () => [...host.querySelectorAll('[aria-label="Playlists"] > [role="treeitem"]')].map((row) => row.textContent?.trim());
+
+    act(() => libraryChanged?.());
+    await settle();
+    act(() => libraryChanged?.());
+    await settle();
+    expect(held).toHaveLength(2);
+
+    // The newer read answers first, then the older one: the older is dropped.
+    act(() => { held[1]?.resolve(fresh); });
+    await settle();
+    act(() => { held[0]?.resolve(stale); });
+    await settle();
+    expect(names()).toEqual(["Sets", "Warm Up", "Main Set", "Peak Time", "Closing", "Fresh Playlist"]);
+
+    // Nor does an older read that fails replace the list with an error.
+    act(() => libraryChanged?.());
+    await settle();
+    act(() => libraryChanged?.());
+    await settle();
+    act(() => { held[3]?.resolve(fresh); });
+    await settle();
+    act(() => { held[2]?.reject(new Error("gone")); });
+    await settle();
+    expect(host.querySelector('[aria-label="Playlists"] [role="alert"]')).toBeNull();
+    expect(names()).toEqual(["Sets", "Warm Up", "Main Set", "Peak Time", "Closing", "Fresh Playlist"]);
+  });
+
   it("imports only the ticked iTunes playlists and refreshes the library column", async () => {
     act(() => root.unmount());
     itunesLibrary = {
@@ -350,8 +454,36 @@ describe("SyncManager", () => {
 
     click(itunesSync);
     await settle();
-    expect(importItunesSelected).toHaveBeenCalledWith("/Users/dj/Music/Music/Library.xml", ["itunes:1"]);
+    expect(importItunesSelected).toHaveBeenCalledWith("/Users/dj/Music/Music/Library.xml", ["itunes:1"], expect.any(Function));
     expect(status()).toContain("Imported 1 playlists from iTunes");
+  });
+
+  it("asks rekordbox's question before replacing same-named lists and imports nothing on Cancel", async () => {
+    act(() => root.unmount());
+    itunesLibrary = {
+      path: "/Users/dj/Music/Music/Library.xml",
+      tree: [{ id: "itunes:0", name: "Police Set", kind: "playlist", depth: 1 }],
+    };
+    // The backend found "Police Set" already in the library: the import
+    // writes nothing unless the question is answered OK.
+    importItunesSelected = vi.fn(async (_path: string, _ids: string[], confirmReplace: (names: string[]) => Promise<boolean>) =>
+      (await confirmReplace(["Police Set"])) ? { imported: 0, existing: 2, skipped: [], playlists: 0, cues: 0, tracks: [] } : null);
+    __setBackend({ ...(await getBackend()), importItunesSelected });
+    confirmExport.mockImplementation(() => Promise.resolve(false));
+    root = createRoot(host);
+    act(() => root.render(<SyncManager onClose={onClose} />));
+    await settle();
+
+    click(box("Police Set"));
+    await settle();
+    click(host.querySelector<HTMLButtonElement>('button[aria-label="Import selected iTunes playlists"]'));
+    await settle();
+    await settle();
+    expect(confirmExport).toHaveBeenCalledWith(
+      "One or several lists with the same name already exist.\nDo you want to replace them with the one you're importing?",
+      { yes: "OK", no: "Cancel", title: "Import" },
+    );
+    expect(status()).not.toContain("Imported");
   });
 
   it("offers a file picker when no iTunes library is detected", () => {
@@ -368,26 +500,15 @@ describe("SyncManager", () => {
     expect(meter?.querySelector("span")?.style.width).toBe("25%");
   });
 
-  it("warns beside a USB stick that is not FAT32", async () => {
+  it("does not warn about the filesystem of a USB stick", async () => {
     listDevices.mockResolvedValueOnce([{ ...stick("USB A"), fileSystem: "exFAT" }]);
     act(() => root.unmount());
     root = createRoot(host);
     act(() => root.render(<SyncManager onClose={onClose} />));
     await settle();
 
-    const warning = host.querySelector('[title="Pioneer DJ recommends FAT32"]');
-    expect(warning?.querySelector("svg")).not.toBeNull();
-    expect(warning?.querySelector("svg")?.getAttribute("aria-label")).toBe("Pioneer DJ recommends FAT32");
-  });
-
-  it("does not warn when Linux reports a FAT32 stick through the vfat driver", async () => {
-    listDevices.mockResolvedValueOnce([{ ...stick("USB A"), fileSystem: "vfat" }]);
-    act(() => root.unmount());
-    root = createRoot(host);
-    act(() => root.render(<SyncManager onClose={onClose} />));
-    await settle();
-
-    expect(host.querySelector('[title="Pioneer DJ recommends FAT32"]')).toBeNull();
+    expect(host.textContent).toContain("USB A");
+    expect(host.querySelector(".filesystemWarning, [title*='FAT32']")).toBeNull();
   });
 
   it("requests post-sync ejection and distinguishes eject errors from sync errors", async () => {
@@ -543,6 +664,65 @@ it("imports cue/grid information from selected devices only", async () => {
   expect(importUsb).toHaveBeenCalledWith("/Volumes/USB A", true, false, false);
   expect(importUsb).toHaveBeenCalledTimes(1);
   expect(status()).toContain("updated 2 tracks");
+});
+
+it("says a stick whose cues already match changed nothing, rather than counting them as updated (#134)", async () => {
+  await renderWith({ importButtonCues: true, importButtonHistory: false, importButtonSettings: false });
+  importUsb.mockResolvedValueOnce({ tracks: 0, histories: 0, settings: 0, skipped: 0, unchanged: 5 });
+  click(box("USB A"));
+  await settle();
+  click(importButton());
+  await settle();
+  expect(status()).toContain("USB A: cues and beat grids already match your library; nothing was changed.");
+  expect(status()).not.toContain("updated");
+});
+
+it("reports changed and already-matching tracks apart", async () => {
+  await renderWith({ importButtonCues: true, importButtonHistory: false, importButtonSettings: false });
+  importUsb.mockResolvedValueOnce({ tracks: 2, histories: 0, settings: 0, skipped: 1, unchanged: 3 });
+  click(box("USB A"));
+  await settle();
+  click(importButton());
+  await settle();
+  expect(status()).toContain("USB A: updated 2 tracks; 3 already up to date; skipped 1.");
+});
+
+it("says where imported CDJ/mixer settings go", async () => {
+  await renderWith({ importButtonCues: false, importButtonHistory: false, importButtonSettings: true });
+  importUsb.mockResolvedValueOnce({ tracks: 0, histories: 0, settings: 3, skipped: 0 });
+  click(box("USB A"));
+  await settle();
+  click(importButton());
+  await settle();
+  expect(status()).toContain("USB A: imported 3 CDJ/mixer settings files. Sync gives them to USB devices that have no settings of their own.");
+});
+
+it("counts one updated track, history entry or settings file in the singular", async () => {
+  await renderWith({ importButtonCues: true, importButtonHistory: true, importButtonSettings: true });
+  importUsb
+    .mockResolvedValueOnce({ tracks: 1, histories: 0, settings: 0, skipped: 0, unchanged: 0 })
+    .mockResolvedValueOnce({ tracks: 0, histories: 1, settings: 0, skipped: 0 })
+    .mockResolvedValueOnce({ tracks: 0, histories: 0, settings: 1, skipped: 0 });
+  click(box("USB A"));
+  await settle();
+  click(importButton());
+  await settle();
+  expect(status()).toContain("USB A: updated 1 track.");
+  expect(status()).toContain("USB A: imported 1 play-history entry.");
+  expect(status()).toContain("USB A: imported 1 CDJ/mixer settings file. Sync gives it to USB devices that have no settings of their own.");
+});
+
+it("says when a stick has no history or settings to import", async () => {
+  await renderWith({ importButtonCues: false, importButtonHistory: true, importButtonSettings: true });
+  importUsb
+    .mockResolvedValueOnce({ tracks: 0, histories: 0, settings: 0, skipped: 0 })
+    .mockResolvedValueOnce({ tracks: 0, histories: 0, settings: 0, skipped: 0 });
+  click(box("USB A"));
+  await settle();
+  click(importButton());
+  await settle();
+  expect(status()).toContain("USB A: no new play-history entries.");
+  expect(status()).toContain("USB A: no CDJ/mixer settings files found.");
 });
 
 it("starts Import's ticks at the Preferences defaults and imports each ticked kind", async () => {

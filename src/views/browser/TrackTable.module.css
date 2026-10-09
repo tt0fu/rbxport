@@ -159,7 +159,23 @@
   cursor: default;
 }
 .headCell[data-sorted] { color: var(--c-accent); }
-.headCell[data-dragging] { opacity: .45; }
+/* A heading being dragged, as rekordbox draws it ([OBS] rekordbox 7.2.14,
+   #207): its place in the row is left blank while a copy of it follows the
+   pointer, and the columns move aside as it passes them. The copy's label
+   measured (198..210) over the header's ground (30) where a resting label is
+   (230): the same heading at about 85% opacity, without its divider. */
+.headCell[data-dragging] { color: transparent; }
+.headCell[data-dragging] > * { visibility: hidden; }
+.headGhost {
+  position: absolute;
+  top: 0;
+  left: 0;
+  background: var(--c-panel);
+  border-right: 0;
+  opacity: .85;
+  pointer-events: none;
+  will-change: transform;
+}
 .headCell { display: flex; align-items: center; }
 
 /* The resize grip: a few pixels at the right edge of every heading, wider than
@@ -308,6 +324,16 @@
   clip-path: polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%);
 }
 .cue { font-size: var(--f-size-xs); color: var(--c-text-dim); }
+/* rekordbox's [!] for a track whose file is missing, drawn rather than typed
+   so it matches at any font. Measured from rekordbox 7.2.14 at 175% (Winrig
+   chris-win11 2026-10-08, issue #201): a 3.5px-wide (FF,96,00) stroke, 14px
+   tall, a 3.5px gap and a 3.5px dot, centred on the row; 2 x 8, 2 and 2 CSS px. */
+.missing {
+  flex: none;
+  width: 2px;
+  height: 12px;
+  background: linear-gradient(var(--c-missing) 0 8px, transparent 8px 10px, var(--c-missing) 10px 12px);
+}
 
 .artwork { padding: 0; position: relative; overflow: hidden; background: var(--c-simple-well); }
 /* The record a cell without artwork shows: `design/icons/ui/record.svg`,
@@ -351,6 +377,49 @@
   background: var(--c-black);
   display: flex;
   align-items: flex-start;
+}
+
+/* The row's waveform, and what the preview draws over it while it plays the
+   row's track. [UNKNOWN] rekordbox's own preview playhead and stop button have
+   not been captured; a plain line and a square stand in for them. */
+.previewWave { position: relative; display: block; flex: none; cursor: pointer; }
+.previewWave canvas { display: block; }
+.previewHead {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 100%;
+  background: var(--c-text);
+  pointer-events: none;
+}
+/* rekordbox's preview stop: a grey ring round a small grey square, on the
+   left of the waveform and centred on it ("Click the stop button on the left
+   side of the waveform", rekordbox 7.2.18 manual p. 90; the ring and square
+   sampled grey there). It was a bare white square in the bottom-right corner,
+   easy to miss (#207). */
+.previewStop {
+  position: absolute;
+  left: 2px;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  padding: 0;
+  transform: translateY(-50%);
+  border: 1px solid var(--c-icon-off);
+  border-radius: 50%;
+  background: var(--c-black);
+  cursor: pointer;
+}
+.previewStop::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 4px;
+  height: 4px;
+  transform: translate(-50%, -50%);
+  background: var(--c-icon-off);
 }
 
 /* Stands in for a cell's text while its page loads: a dim bar on the row's

@@ -13,12 +13,13 @@ import type { TreeNode } from "@/ipc/types";
 import styles from "./TreeView.module.css";
 import { DeviceIcon, EjectIcon, FolderIcon, HistoryIcon, ListIcon, NoteIcon, SmartListIcon } from "@/components/icons";
 import { ContextMenu } from "@/components/ContextMenu";
-import { treeMenu } from "@/lib/contextMenus";
+import { deviceTreeMenu, treeMenu, type MenuTarget } from "@/lib/contextMenus";
 import {
   branchIds, childrenOf, containerOf, emptySources, newlyClosed, nodesForSource, sourceOf,
   subtreeIds, toggle, visibleNodes, searchTree, type TreeSearchScope, type Source,
 } from "@/lib/tree";
 import { SourceRail } from "./SourceRail";
+import { browseListVars } from "@/lib/preferences";
 import { usePreferences } from "@/store/usePreferences";
 import type { TreeExpansion } from "@/lib/session";
 
@@ -98,8 +99,12 @@ const Row = memo(function Row({
   /** Whether a track drag could land here. */
   droppable: boolean;
   onDropTracks: ((playlistId: string) => void) | undefined;
-  /** Files dragged in from outside the app, dropped on this row. */
-  onDropFiles: ((playlistId: string, files: File[]) => void) | undefined;
+  /**
+   * Files dragged in from outside the app, dropped on this row: a playlist's
+   * id, or the Playlists root's (`"playlists"`) or a playlist folder's, where
+   * each dropped folder becomes a playlist, as in rekordbox.
+   */
+  onDropFiles: ((target: string, files: File[]) => void) | undefined;
   onMenu: ((node: TreeNode, at: { x: number; y: number }) => void) | undefined;
   /** Whether anything sits under this node, so it can be opened at all. */
   branch: boolean;
@@ -116,13 +121,14 @@ const Row = memo(function Row({
   // which the backend says by sending it an open/closed state.
   const historyFolder = node.kind === "history" && (branch || node.expanded !== undefined);
   const Icon =
-    node.kind === "folder" || node.kind === "directory" || historyFolder
+    node.kind === "folder" || node.kind === "directory" || historyFolder ||
+    node.kind === "devicePlaylists" || node.kind === "deviceFolder"
       ? FolderIcon
       : node.kind === "history"
         ? HistoryIcon
-        : node.kind === "allTracks"
+        : node.kind === "allTracks" || node.kind === "deviceAllTracks"
           ? NoteIcon
-          : node.kind === "device"
+          : node.kind === "device" || node.kind === "deviceLibrary"
             ? DeviceIcon
             : node.kind === "smartPlaylist"
               ? SmartListIcon
@@ -135,8 +141,10 @@ const Row = memo(function Row({
   // A file dragged in from Finder/Explorer never sets `dragging`/`droppable`
   // (nothing inside the app started that drag), so it is its own path: any
   // playlist row that was given `onDropFiles` takes one, gated on the
-  // browser's own file-drag signal instead.
-  const fileDroppable = node.kind === "playlist" && Boolean(onDropFiles);
+  // browser's own file-drag signal instead. So do the Playlists root and a
+  // playlist folder, which make a playlist of each folder dropped there.
+  const fileDroppable = Boolean(onDropFiles)
+    && (node.kind === "playlist" || node.kind === "folder" || node.id === "playlists");
   useEffect(() => {
     if (!droppable && !fileDroppable) setOver(false);
   }, [droppable, fileDroppable]);
@@ -222,9 +230,9 @@ const Row = memo(function Row({
       }}
       data-move={moveEdge ?? undefined}
       onContextMenu={(e) => {
-        // Only the kinds that have a menu: the fixed roots and the device
-        // nodes are not playlists and have nothing to offer.
-        if ((node.kind !== "collection" && node.kind !== "playlist" && node.kind !== "smartPlaylist" && node.kind !== "folder") || !onMenu) return;
+        // Only the kinds that have a menu: the fixed roots and a stick's
+        // own row and headings, which have nothing to offer here.
+        if (!MENU_KINDS.has(node.kind) || !onMenu) return;
         e.preventDefault();
         onMenu(node, { x: e.clientX, y: e.clientY });
       }}
@@ -302,12 +310,27 @@ const Row = memo(function Row({
   );
 });
 
+/** The tree kinds a right-click opens a menu over. */
+const MENU_KINDS: ReadonlySet<TreeNode["kind"]> = new Set([
+  "collection", "playlist", "smartPlaylist", "folder", "devicePlaylists", "deviceFolder", "devicePlaylist",
+]);
+
+/** A stick's own playlists and folders, which its menus and renames act on. */
+function isDeviceMenuKind(kind: TreeNode["kind"]): kind is "devicePlaylists" | "deviceFolder" | "devicePlaylist" {
+  return kind === "devicePlaylists" || kind === "deviceFolder" || kind === "devicePlaylist";
+}
+
+/** The measured row pitch, `--s-row-height`. */
+const TREE_ROW_H = 25;
+
 export interface TreeViewProps {
   nodes: readonly TreeNode[];
   selectedId: string | null;
   onSelect: (node: TreeNode) => void;
-  /** Write a playlist to a stick. */
-  onExport?: (node: TreeNode) => void;
+  /** Write a playlist or folder to the stick mounted at `path`. */
+  onExport?: (node: TreeNode, path: string) => void;
+  /** The sticks Export Playlist and Export Folder list, by mount path. */
+  exportDevices?: readonly MenuTarget[];
   /** Export a playlist to a file: an m3u8 or rekordbox's tab-separated txt. */
   onExportFile?: (node: TreeNode, format: "m3u8" | "txt") => void;
   /** Create, delete and rename, which the shell owns because they write. */
@@ -330,8 +353,11 @@ export interface TreeViewProps {
   dragging?: boolean;
   /** Drop the dragged tracks onto a playlist. */
   onDropTracks?: (playlistId: string) => void;
-  /** Files dragged in from outside the app (Finder, Explorer), dropped onto a playlist. */
-  onDropFiles?: ((playlistId: string, files: File[]) => void) | undefined;
+  /**
+   * Files dragged in from outside the app (Finder, Explorer), dropped onto a
+   * playlist, or onto the Playlists root (`"playlists"`) or a playlist folder.
+   */
+  onDropFiles?: ((target: string, files: File[]) => void) | undefined;
   /**
    * A lazy node was opened: read what is under it. The Explorer's folders,
    * whose children are not known until somebody looks.
@@ -358,20 +384,30 @@ export interface TreeViewProps {
   onDeleteShortcut?: (id: string) => void;
   /** Safely eject a connected volume from its row in the Devices tree. */
   onEjectDevice?: (node: TreeNode) => void;
+  /**
+   * A stick's own playlists: create under its Playlists heading or a folder,
+   * rename and delete. Each acts on the library the node belongs to.
+   */
+  onDeviceCreate?: (parent: TreeNode, folder: boolean) => void;
+  onDeviceRename?: (node: TreeNode, name: string) => void;
+  onDeviceDelete?: (node: TreeNode) => void;
   ejectingDeviceId?: string | null;
   deviceBusy?: boolean;
 }
 
 export const TreeView = memo(function TreeView({
-  nodes, selectedId, onSelect, dragging, onDropTracks, onDropFiles, onExport, onExportFile,
+  nodes, selectedId, onSelect, dragging, onDropTracks, onDropFiles, onExport, exportDevices, onExportFile,
   onCreatePlaylist, onCreateFolder, onDeleteNode, onRenameNode, onMoveNode, readOnly = false,
   onExpand, showCounts = false, onOpenSync,
   initialExpansion, onExpansionChange,
   onCreateSmartPlaylist, onEditSmartPlaylist, onAddArtwork, onAddToShortcut, onSortItems,
   railShortcuts, onOpenShortcut, onDeleteShortcut,
   onEjectDevice, ejectingDeviceId, deviceBusy = false,
+  onDeviceCreate, onDeviceRename, onDeviceDelete,
 }: TreeViewProps) {
-  const { advanced: { doubleClickToEdit } } = usePreferences();
+  const { advanced: { doubleClickToEdit }, view } = usePreferences();
+  // Browse › FontSize and Line Space apply to the tree as they do the list.
+  const listVars = browseListVars(view, TREE_ROW_H);
   const [query, setQuery] = useState("");
   const [scope, setScope] = useState<TreeSearchScope>("all");
   /** The tree menu: where it is, and which node it was opened on. */
@@ -384,7 +420,17 @@ export const TreeView = memo(function TreeView({
         (node.kind === "playlist" || node.kind === "smartPlaylist" || node.kind === "folder")) {
       setRenamingId(node.id);
     }
-  }, [readOnly, onRenameNode]);
+    // A stick's playlist or folder renames in place, as rekordbox's does
+    // [OBS 7.2.14: a click on the selected row]; not while it is busy.
+    if (!readOnly && !deviceBusy && onDeviceRename && (node.kind === "devicePlaylist" || node.kind === "deviceFolder")) {
+      setRenamingId(node.id);
+    }
+  }, [readOnly, onRenameNode, deviceBusy, onDeviceRename]);
+  const renameNode = useCallback((node: TreeNode, name: string) => {
+    if (node.kind === "devicePlaylist" || node.kind === "deviceFolder") onDeviceRename?.(node, name);
+    else onRenameNode?.(node, name);
+  }, [onRenameNode, onDeviceRename]);
+  const canRename = Boolean(onRenameNode) || Boolean(onDeviceRename);
   useEffect(() => {
     if (readOnly) endRename();
   }, [readOnly, endRename]);
@@ -548,7 +594,7 @@ export const TreeView = memo(function TreeView({
       <div className={styles.content}>
       <SearchField className={styles.search} value={query} onChange={setQuery} scope={scope} onScopeChange={setScope}
         options={TREE_SEARCH_OPTIONS} menuWidth={154} label="Search library tree" scopeLabel="Tree search scope" />
-      <div className={styles.nodes} role="tree" ref={list}>
+      <div className={styles.nodes} role="tree" ref={list} style={listVars}>
         {visible.map((node) => (
           <Row
             key={node.id}
@@ -562,11 +608,11 @@ export const TreeView = memo(function TreeView({
             onDropTracks={onDropTracks}
             onDropFiles={onDropFiles}
             onMenu={(node, at) => setMenu({ ...at, node })}
-            count={showCounts && node.kind === "playlist" ? node.childCount : undefined}
+            count={showCounts && (node.kind === "playlist" || node.kind === "devicePlaylist") ? node.childCount : undefined}
             renaming={!readOnly && node.id === renamingId}
-            onRename={readOnly ? undefined : onRenameNode}
+            onRename={readOnly ? undefined : renameNode}
             onRenameEnd={endRename}
-            onRenameStart={readOnly || !onRenameNode ? undefined : beginRename}
+            onRenameStart={readOnly || !canRename ? undefined : beginRename}
             doubleClickToEdit={doubleClickToEdit}
             movable={
               Boolean(onMoveNode) &&
@@ -589,20 +635,44 @@ export const TreeView = memo(function TreeView({
 
       </div>
 
-      {menu ? (
+      {menu && isDeviceMenuKind(menu.node.kind) ? (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          rows={deviceTreeMenu(menu.node.kind)}
+          label={menu.node.kind === "deviceFolder" ? "Folder" : menu.node.kind === "devicePlaylists" ? "Playlists" : "Playlist"}
+          context={{ inPlaylist: false, hasFile: false, readOnly: readOnly || deviceBusy }}
+          onChoose={(action) => {
+            switch (action) {
+              case "deviceCreatePlaylist":
+                onDeviceCreate?.(menu.node, false);
+                break;
+              case "deviceCreateFolder":
+                onDeviceCreate?.(menu.node, true);
+                break;
+              case "deviceDelete":
+                onDeviceDelete?.(menu.node);
+                break;
+            }
+          }}
+          onClose={() => setMenu(null)}
+        />
+      ) : menu ? (
         <ContextMenu
           x={menu.x}
           y={menu.y}
           rows={treeMenu(
             menu.node.kind === "collection" ? "collection" : menu.node.kind === "folder" ? "folder" : menu.node.kind === "smartPlaylist" ? "smartPlaylist" : "playlist",
+            exportDevices,
           )}
           label={menu.node.kind === "folder" ? "Folder" : menu.node.kind === "collection" ? "Playlists" : "Playlist"}
           context={{ inPlaylist: true, hasFile: true, readOnly }}
           onChoose={(action) => {
+            if (action.startsWith("exportTo:")) {
+              onExport?.(menu.node, action.slice("exportTo:".length));
+              return;
+            }
             switch (action) {
-              case "export":
-                onExport?.(menu.node);
-                break;
               case "exportM3u8":
                 onExportFile?.(menu.node, "m3u8");
                 break;

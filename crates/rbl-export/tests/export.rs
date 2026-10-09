@@ -319,6 +319,41 @@ fn a_fresh_stick_takes_the_defaults_it_is_given_and_keeps_them_after() {
 }
 
 #[test]
+fn the_pdb_property_row_names_the_stick_and_keeps_its_background_colour() {
+    use rbl_onelibrary::settings::StickSettings;
+
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let tracks = vec![track(src.path(), 1, "One", "A"), track(src.path(), 2, "Two", "B")];
+    let defaults = StickSettings { device_name: "FRIDAY".into(), ..StickSettings::default() };
+    rbl_export::export_with(dest.path(), &tracks, &[], Some(&defaults)).unwrap();
+
+    let pdb_path = dest.path().join("PIONEER/rekordbox/export.pdb");
+    let bytes = std::fs::read(&pdb_path).unwrap();
+    let property = rbl_pdb::Pdb::parse(&bytes).unwrap().property().expect("a property row");
+    // The same name and count as exportLibrary.db's property row.
+    assert_eq!(property.device_name, "FRIDAY");
+    assert_eq!(property.contents, 2);
+    assert_eq!(property.db_version, "1000");
+    assert_eq!(property.created_date.len(), 10);
+    assert_eq!(property.background_color, 0);
+
+    // rekordbox sets "Background Color : Device Library" to Blue.
+    let blue = rbl_pdb::rows::PdbProperty { background_color: 7, ..property };
+    let row = rbl_pdb::rows::property_row(&blue).unwrap();
+    let patched = rbl_pdb::build::replace_single_page_table(&bytes, 19, &[row]).unwrap();
+    std::fs::write(&pdb_path, patched).unwrap();
+
+    // A sync rebuilds export.pdb and keeps the colour.
+    rbl_export::export_with(dest.path(), &tracks[..1], &[], None).unwrap();
+    let bytes = std::fs::read(&pdb_path).unwrap();
+    let kept = rbl_pdb::Pdb::parse(&bytes).unwrap().property().unwrap();
+    assert_eq!(kept.background_color, 7);
+    assert_eq!(kept.device_name, "FRIDAY");
+    assert_eq!(kept.contents, 1);
+}
+
+#[test]
 fn a_blank_stick_is_given_the_database_folders_rekordbox_creates_on_connect() {
     let stick = tempfile::tempdir().unwrap();
     assert!(rbl_export::create_library(stick.path(), None, &[], None).expect("create"), "a blank stick gets a database");
@@ -338,7 +373,7 @@ fn a_blank_stick_is_given_the_database_folders_rekordbox_creates_on_connect() {
             3 => rbl_pdb::PageType::Albums, 4 => rbl_pdb::PageType::Labels, 5 => rbl_pdb::PageType::Keys,
             6 => rbl_pdb::PageType::Colors, 7 => rbl_pdb::PageType::PlaylistTree, 8 => rbl_pdb::PageType::PlaylistEntries,
             13 => rbl_pdb::PageType::Artwork, 16 => rbl_pdb::PageType::Columns, 17 => rbl_pdb::PageType::HistoryPlaylists,
-            18 => rbl_pdb::PageType::HistoryEntries, 19 => rbl_pdb::PageType::History, other => rbl_pdb::PageType::Other(other),
+            18 => rbl_pdb::PageType::HistoryEntries, 19 => rbl_pdb::PageType::Property, other => rbl_pdb::PageType::Other(other),
         })).unwrap_or(u32::MAX),
     }).collect();
     assert_eq!(types, (0..20).collect::<Vec<u32>>());
@@ -348,7 +383,7 @@ fn a_blank_stick_is_given_the_database_folders_rekordbox_creates_on_connect() {
     assert_eq!(census.get("columns"), Some(&27));
     assert_eq!(census.get("history_playlists"), Some(&22));
     assert_eq!(census.get("history_entries"), Some(&17));
-    assert_eq!(census.get("history"), Some(&1));
+    assert_eq!(census.get("property"), Some(&1));
 
     // Its settings can be read and written like any stick's.
     let settings = rbl_onelibrary::settings::StickSettings::read(&stick.path().join("PIONEER/rekordbox/exportLibrary.db")).expect("settings");
@@ -589,6 +624,7 @@ fn compatibility_conversion_reuses_outputs_updates_paths_and_can_be_disabled() {
     let mut export_id = None;
     for (compatibility, ext, bitrate) in [
         (Some(CompatibilityFormat::Wav), "wav", 1411),
+        (Some(CompatibilityFormat::Aiff), "aiff", 1411),
         (Some(CompatibilityFormat::Mp3), "mp3", 320),
         (None, "flac", 0),
     ] {
@@ -610,7 +646,7 @@ fn compatibility_conversion_reuses_outputs_updates_paths_and_can_be_disabled() {
         let pdb = rbl_pdb::Pdb::parse(&pdb_bytes).unwrap();
         let rows = pdb.track_rows(pdb.table(rbl_pdb::PageType::Tracks).unwrap());
         let raw = pdb.rows(pdb.table(rbl_pdb::PageType::Tracks).unwrap())[0];
-        assert_eq!(pdb.u2_at(raw, 0x5a), match ext { "wav" => 11, "mp3" => 1, "flac" => 5, _ => unreachable!() },
+        assert_eq!(pdb.u2_at(raw, 0x5a), match ext { "wav" => 11, "aiff" => 12, "mp3" => 1, "flac" => 5, _ => unreachable!() },
             "the CDJ format must describe the exported audio, including conversion");
         assert_eq!(rows[0].file_path, entry.audio);
         assert_eq!(rows[0].sample_rate, if compatibility.is_some() { 44100 } else { 96000 });
@@ -746,4 +782,22 @@ fn a_firmware_path_hash_collision_keeps_both_analysis_bundles() {
     let after = rbl_export::Manifest::load(dest.path()).unwrap();
     assert_eq!(before.tracks[1].audio,after.tracks[1].audio);
     assert!(verify(dest.path()).unwrap().is_ok());
+}
+
+/// A row of `export.pdb` has to fit on one page. A track whose tags are
+/// longer used to be cut off on the page and the stick refused as "Device
+/// Library and OneLibrary disagree"; it is now refused before anything is
+/// written, naming the track.
+#[test]
+fn a_track_with_more_text_than_a_pdb_row_holds_is_refused_by_name() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let mut long = track(src.path(), 1, "Very Long Notes", "TRIODE");
+    long.comment = "é".repeat(2500);
+    let tracks = vec![long, track(src.path(), 2, "Short", "ARTBAT")];
+    let playlists = vec![SourcePlaylist { name: "P".into(), track_indices: vec![0, 1], ..Default::default() }];
+    let error = export(dest.path(), &tracks, &playlists).unwrap_err().to_string();
+    assert!(error.contains("'Very Long Notes'") && error.contains("export.pdb"), "{error}");
+    assert!(!dest.path().join("PIONEER/rekordbox/export.pdb").exists());
+    assert!(!dest.path().join("Contents/TRIODE").exists());
 }

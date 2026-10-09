@@ -31,6 +31,7 @@ import {
   DETAIL_BARS,
   NO_BEATS,
   nearestBeatMs,
+  callLeavesFrom,
   subdivideGrid,
   ZOOM_STEPS,
   showsEveryBeat,
@@ -42,6 +43,7 @@ import {
   jumpSizeById,
   jumpStepSeconds,
   zoomBy,
+  createWheelZoomGate,
   needsRedraw,
   OVERDRAW,
   scrollOffset,
@@ -57,6 +59,12 @@ import {
   type CuePanel,
   type PadMode,
   beatLoopRange,
+  clampLoopBeats,
+  LOOP_BEATS_MAX,
+  LOOP_BEATS_MIN,
+  loopBeatsLabel,
+  resizedLoopRange,
+  wrapIntoLoop,
   tempoAtMs,
   tempoAnnotations,
   type BeatGrid as TrackBeatGrid,
@@ -71,7 +79,7 @@ import { TempoSlider } from "./TempoSlider";
 import type { HotCueColor } from "@/lib/preferences";
 import { formatKey, quantizeFraction } from "@/lib/preferences";
 import {
-  beatNudgeFor, beatWait, MAX_TEMPO, MIN_TEMPO, syncTo, tempoFor, type Deck as SyncDeck,
+  beatNudgeFor, beatWait, inPhaseAt, MAX_TEMPO, MIN_TEMPO, syncTo, tempoFor, type Deck as SyncDeck,
 } from "@/lib/sync";
 import {
   beatLoopLength, detectPlatform, dispatchBinding, hotCuePad, matchBinding, memoryCueNumber,
@@ -84,6 +92,7 @@ import { useTrackCues } from "./useTrackCues";
 import { useTrackDetails } from "./useTrackDetails";
 import { useTrackGrid } from "./useTrackGrid";
 import { useGridEditor } from "./useGridEditor";
+import { nudgeGrid } from "@/lib/gridEdit";
 import { listenEditHistory } from "@/lib/editHistory";
 import { registerDeck } from "@/lib/scripting";
 import { useHoldRepeat } from "./useHoldRepeat";
@@ -213,6 +222,15 @@ export interface PlayerProps {
   leaderBpmX100?: number | null;
   /** What this deck is playing at, for the shell to hand to a synced deck. */
   onPlayingBpm?: ((bpmX100: number | null) => void) | undefined;
+  /** This deck's key shift in semitones, for the shell's Traffic Light. */
+  onKeyShift?: ((semitones: number) => void) | undefined;
+  /**
+   * A grid shift on this deck, in milliseconds, for the shell to hand to the
+   * other deck: a deck synced to this one moves with it. `publishGridFollow`
+   * registers what the shell calls on this deck when the other one shifts.
+   */
+  onGridNudge?: ((ms: number) => void) | undefined;
+  publishGridFollow?: ((follow: (ms: number) => void) => void) | undefined;
   /**
    * Load whatever the browser has selected.
    *
@@ -543,6 +561,22 @@ const PLAY_RECORD_SECONDS = 60;
  */
 const HOT_CUE_KEYS: Partial<Record<(typeof PADS)[number], string>> = { A: "1", B: "2", C: "3" };
 
+/** How often the phase lock checks a locked deck, in milliseconds. */
+const PHASE_CHECK_MS = 100;
+/**
+ * How far off the master's beat a locked deck can be before the lock moves
+ * it, in seconds. Two hits further apart than about 10 ms sound as two.
+ */
+const PHASE_TOLERANCE = 0.01;
+/** How long the lock waits after its own move, before it checks again. */
+const PHASE_SETTLE_MS = 250;
+/**
+ * How far from its beat a waiting hot cue call may find the head and still
+ * jump, in seconds: a timer late under load. Further than this, a jump, a
+ * drag or a cue moved the head first, and the call is dropped.
+ */
+const CALL_DRIFT = 0.15;
+
 /**
  * What GRID puts in the pad row, read off `docs/screenshots`.
  *
@@ -738,7 +772,7 @@ export const Player = memo(function Player({
   simple = false, transportSlot, flipped = false, dual = false, publishZoom,
   bars: linkedBars, onBars, jumpSize: linkedJump, onJumpSize,
   publishSync, peerSync, isMaster = false, onMaster, synced = false, onSyncToggle,
-  leaderBpmX100 = null, onPlayingBpm, readOnly = false,
+  leaderBpmX100 = null, onPlayingBpm, onKeyShift, onGridNudge, publishGridFollow, readOnly = false,
 }: PlayerProps) {
   const playback = usePlayback(track?.id ?? null, deck, false);
   // The waveforms follow their containers, which change with the window and
@@ -758,7 +792,13 @@ export const Player = memo(function Player({
   const barsLabel = useRef<HTMLSpanElement>(null);
   // The grid and the GRID panel's state, kept current by the backend: an
   // edit from any deck refetches both — see `useTrackGrid`.
-  const { grid, state: gridState, setState: setGridState } = useTrackGrid(track);
+  const { grid: savedGrid, state: gridState, setState: setGridState, gridTrackId } = useTrackGrid(track);
+  // A grid shift plays before its save ends: the shifted grid stands in for
+  // the saved one until the save comes back. Kept with its track, so a
+  // track change drops it.
+  const [nudge, setNudge] = useState<{ track: string; grid: TrackBeatGrid } | null>(null);
+  const nudgePreview = nudge !== null && nudge.track === track?.id ? nudge.grid : null;
+  const grid = nudgePreview ?? savedGrid;
   // The tempo, from the grid where there is one: an edit that changes it
   // reaches here before the browser's row is re-read.
   const bpmX100 = gridState?.bpmX100 ?? track?.bpmX100 ?? 0;
@@ -1044,14 +1084,18 @@ export const Player = memo(function Player({
   /**
    * The wheel zooms, over the waveform it is pointing at.
    *
-   * One step per gesture whatever the device: a mouse notch arrives as about a
-   * hundred pixels and a trackpad as a stream of ones, so the size of the
-   * delta says nothing useful and only its sign is read.
+   * Travel is accumulated and rate-limited (see `createWheelZoomGate`): a
+   * trackpad streams many small events plus inertia, and a step per event
+   * ran through the whole zoom range in one swipe.
    */
+  const wheelGate = useRef(createWheelZoomGate());
   const wheelZoom = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
     if (event.deltaY === 0) return;
     event.preventDefault();
-    setBars((current) => zoomBy(current, event.deltaY > 0 ? 1 : -1));
+    // Line and page modes (mice on some platforms) report lines, not pixels.
+    const px = event.deltaY * (event.deltaMode === 1 ? 33 : event.deltaMode === 2 ? 400 : 1);
+    const direction = wheelGate.current(px, event.timeStamp);
+    if (direction !== 0) setBars((current) => zoomBy(current, direction));
   }, [setBars]);
 
   const zoom = useCallback((by: number) => {
@@ -1081,14 +1125,56 @@ export const Player = memo(function Player({
     return () => document.removeEventListener("pointerdown", elsewhere, true);
   }, []);
 
+  // What the other deck reads when its BEAT SYNC is pressed. A ref holding a
+  // closure over the current render, registered once: the shell keeps the
+  // getter, not the values, so nothing here re-renders anything there.
+  const syncState = useRef<() => SyncDeck | null>(() => null);
+  syncState.current = () =>
+    track
+      ? {
+          bpmX100,
+          tempo: playback.tempo,
+          playing: playback.playing,
+          position: playback.positionNow(),
+          grid,
+        }
+      : null;
+  useEffect(() => {
+    publishSync?.(() => syncState.current());
+  }, [publishSync]);
+
+  /** BEAT SYNC lit and Q on: the deck must stay on the master's beat. */
+  const phaseLocked = synced && quantize;
+  /**
+   * BEAT SYNC lit, matching beats rather than only the BPM: a track loaded
+   * while PLAY is engaged goes onto the master's beat, Q on or off, as in
+   * rekordbox 7 [OBS chris-win11, parity/issue-128]. Q adds the lock that
+   * keeps it there through jumps, cues and loops: see `phaseLocked`. PLAY
+   * starts on the beat in either sync type: see `togglePlay`.
+   */
+  const beatSynced = synced && advancedPrefs.syncType !== "bpm";
+  /**
+   * Where a move on a locked, playing deck lands: on the master's beat, by
+   * `inPhaseAt`. A master that is stopped has no beat to keep, so the move
+   * stays as it is.
+   */
+  const inPhase = useEventCallback((at: number) => {
+    if (!phaseLocked || !playback.playing) return at;
+    const leader = peerSync?.();
+    const follower = syncState.current();
+    if (!leader?.playing || !follower) return at;
+    return inPhaseAt(leader, follower, at, playback.loop?.active ? playback.loop : null);
+  });
+  const seekInPhase = useCallback((at: number) => playback.seek(inPhase(at)), [playback, inPhase]);
+
   /** Moves by the chosen size: a number of beats, or the fine nudge. */
   const jump = useCallback(
     (direction: number) => {
       const step = jumpStepSeconds(jumpSizeById(jumpSizeId), bpmX100);
       if (step === 0) return;
-      playback.seek(playback.positionRef.current + step * direction);
+      seekInPhase(playback.positionRef.current + step * direction);
     },
-    [jumpSizeId, bpmX100, playback],
+    [jumpSizeId, bpmX100, playback, seekInPhase],
   );
 
 
@@ -1098,9 +1184,19 @@ export const Player = memo(function Player({
    * which; this only carries it out and remembers whether a preview is running.
    */
   const previewing = useRef(false);
+  /**
+   * A track loaded while playing, still to be put on the master's beat once
+   * it is ready: see the effect after `togglePlay`. A CUE or a PLAY before
+   * then takes the deck over and drops it.
+   */
+  const alignAfterLoad = useRef<string | null>(null);
+  /** The move a ready load still has to make: see `alignToMaster`. */
+  const alignTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   const holdCue = useCallback(() => {
     if (playback.idle) return;
+    alignAfterLoad.current = null;
+    globalThis.clearTimeout(alignTimer.current);
     const action = pressCue(
       playback.positionRef.current,
       cuePoint,
@@ -1121,15 +1217,60 @@ export const Player = memo(function Player({
     if (playback.playing) playback.toggle();
   }, [playback, cuePoint]);
 
-  const { seek } = playback;
+  const seek = seekInPhase;
   const positionSeconds = useCallback(() => positionRef.current, [positionRef]);
   const memory = useMemoryCues({
     trackId: playback.idle ? null : track?.id ?? null,
     cues, positionSeconds, seek, setLoop: playback.setLoop, cuePoint, setCuePoint, readOnly, onError,
   });
+  // A called hot cue plays from its point, as rekordbox does from pause. It
+  // goes through PLAY, so a synced deck starts on the master's beat too.
+  const playFromCue = useEventCallback(() => {
+    if (!playback.playing) togglePlay();
+  });
+  /**
+   * A hot cue called with Q on, waiting for its beat: see `useHotCues`. One
+   * at a time; a second call takes the place of the first.
+   */
+  const pendingCall = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const playingNow = useRef(playback.playing);
+  playingNow.current = playback.playing;
+  const cancelCall = useCallback(() => {
+    globalThis.clearTimeout(pendingCall.current);
+    pendingCall.current = undefined;
+  }, []);
+  /**
+   * Plays on to `at` and jumps to `to` there. The jump is a move from the
+   * engine's own head, so a timer that fires a few milliseconds late lands
+   * the same few past the cue and the beat runs on unbroken, as rekordbox's
+   * warp point pair does (`AudioPlayerCore::doSetWarpPointPair`). Anything
+   * else that moved the head in the meantime called the jump off. A call
+   * that left a loop of `wrap` seconds reads the head modulo the loop: see
+   * `callLeavesFrom`.
+   */
+  const jumpAt = useEventCallback((at: number, to: number, from: number, wrap: number) => {
+    cancelCall();
+    const rate = playback.tempo > 0 ? playback.tempo : 1;
+    const wait = Math.max(0, ((at - from) * 1000) / rate);
+    pendingCall.current = globalThis.setTimeout(() => {
+      pendingCall.current = undefined;
+      if (!playingNow.current) return;
+      const leave = callLeavesFrom(playback.positionNow(), at, wrap, CALL_DRIFT);
+      if (leave !== null) playback.moveBy(to - leave);
+    }, wait);
+  });
+  const playingLoop = useEventCallback(() => (playback.loop?.active ? playback.loop : null));
+  const leaveLoop = useEventCallback(() => playback.setLoopActive(false));
+  // A pause, a new track or an empty deck leaves no beat to wait for.
+  useEffect(() => {
+    if (!playback.playing) cancelCall();
+  }, [playback.playing, cancelCall]);
+  useEffect(() => cancelCall, [track?.id, cancelCall]);
+  const deckPlaying = useCallback(() => playback.playing, [playback.playing]);
   const hot = useHotCues({
     trackId: playback.idle ? null : track?.id ?? null,
-    cues, positionSeconds, seek, quantiseTo: quantize ? quantizeGrid : null, readOnly, onError,
+    cues, positionSeconds, seek, play: playFromCue, playing: deckPlaying, jumpAt, activeLoop: playingLoop, exitLoop: leaveLoop,
+    quantiseTo: quantize ? quantizeGrid : null, readOnly, onError,
   });
   // The hooks own editability, so the disabled state and its explanation
   // must come from that same result. Keeping a second readOnly-only branch
@@ -1145,11 +1286,43 @@ export const Player = memo(function Player({
     const start = Math.max(0, grid.times.findIndex(time => time >= startTime));
     return grid.tempos.slice(start).some(tempo => tempo !== grid.tempos[start]);
   }, [grid]);
+  /**
+   * BEAT SYNC lit: the deck moves `ms` of its own track with a grid shift,
+   * so it keeps its place against the master's beat. A move by the shift,
+   * not a new match, so an offset the DJ chose stays.
+   */
+  const followShift = useCallback((ms: number) => {
+    if (!synced || !playback.playing || advancedPrefs.syncType === "bpm") return;
+    playback.moveBy(ms / 1000);
+  }, [synced, playback, advancedPrefs.syncType]);
+  // The master's grid moved `ms` of its track later: its beat comes that
+  // much later in time, so this deck goes back by the same time, measured
+  // at the two decks' tempos.
+  const followMaster = useEventCallback((ms: number) => {
+    followShift(-ms * playback.tempo / (peerSync?.()?.tempo ?? 1));
+  });
+  useEffect(() => {
+    publishGridFollow?.(followMaster);
+  }, [publishGridFollow, followMaster]);
+  const totalMs = Math.round(total * 1000);
+  const onNudge = useCallback((ms: number) => {
+    const id = track?.id;
+    if (id === undefined) return;
+    setNudge(p => ({ track: id, grid: nudgeGrid(p?.track === id ? p.grid : savedGrid, ms, totalMs) }));
+    followShift(ms);
+    onGridNudge?.(ms);
+  }, [track?.id, savedGrid, totalMs, followShift, onGridNudge]);
+  // A save that fails leaves the saved grid as it was, so the deck goes back to it.
+  const onGridError = useCallback((message: string | null) => {
+    if (message !== null) setNudge(null);
+    onError?.(message);
+  }, [onError]);
   const gridEditor = useGridEditor({
     trackId: playback.idle ? null : track?.id ?? null,
-    deck, state: gridState, setState: setGridState, positionMs, readOnly, onError,
-    durationMs: Math.round(total * 1000),
+    deck, state: gridState, setState: setGridState, positionMs, readOnly, onError: onGridError,
+    durationMs: totalMs,
     isDynamicFrom,
+    onNudge,
   });
   const { state: historyState, undo: undoGrid, redo: redoGrid } = gridEditor;
   useEffect(() => {
@@ -1172,12 +1345,15 @@ export const Player = memo(function Player({
   /** A LOOP IN pressed and waiting for its OUT, in seconds. */
   const [loopIn, setLoopIn] = useState<number | null>(null);
   const activeLoop = playback.loop?.active ?? false;
+  // A locked deck loops on whole beats: a loop IN between two beats, or a
+  // length such as 1.5 beats, takes the deck off the master's beat.
+  const loopSnap = quantize ? (phaseLocked ? grid : quantizeGrid) : null;
   /** A loop of so many beats from the playhead, on the grid when Q is on. */
   const loopOfBeats = useCallback((beats: number) => {
     if (playback.idle) return;
-    const range = beatLoopRange(grid, quantize ? quantizeGrid : null, playback.positionNow() * 1000, beats);
+    const range = beatLoopRange(grid, loopSnap, playback.positionNow() * 1000, beats);
     if (range) playback.setLoop(range[0] / 1000, range[1] / 1000);
-  }, [playback, grid, quantize, quantizeGrid]);
+  }, [playback, grid, loopSnap]);
   const autoLoop = useCallback(() => {
     if (playback.idle) return;
     if (activeLoop) {
@@ -1186,20 +1362,87 @@ export const Player = memo(function Player({
     }
     loopOfBeats(loopBeats);
   }, [playback, activeLoop, loopOfBeats, loopBeats]);
+  /** The head in seconds, on the loop snap grid when Q is on. */
+  const loopPoint = useCallback(() => {
+    const ms = playback.positionNow() * 1000;
+    return (loopSnap && loopSnap.times.length > 0 ? nearestBeatMs(loopSnap, ms) : ms) / 1000;
+  }, [playback, loopSnap]);
+  /**
+   * IN: the loop's in point, and the cue point too — rekordbox's Real-Time
+   * Cue, which is how a playing deck gets a cue point for MEMORY to store.
+   * [OBS] rekordbox 7.2.19 `UiPlayer::eventLoopIn` @0x102258ff0 calls the
+   * deck's `setCurrentCue` at the head (snapped to the beat with Q on, as the
+   * manual's Real-Time Cue says), playing or paused; with a loop running it
+   * adjusts the loop instead, so the cue point stays.
+   */
   const markLoopIn = useCallback(() => {
     if (playback.idle) return;
-    setLoopIn(playback.positionNow());
-  }, [playback]);
+    const at = loopPoint();
+    setLoopIn(at);
+    if (!playback.loop?.active) setCuePoint(at);
+  }, [playback, loopPoint]);
   const markLoopOut = useCallback(() => {
     if (playback.idle || loopIn === null) return;
-    const out = playback.positionNow();
+    const out = loopPoint();
     if (out > loopIn) playback.setLoop(loopIn, out);
     setLoopIn(null);
-  }, [playback, loopIn]);
+  }, [playback, loopIn, loopPoint]);
   const reloopOrExit = useCallback(() => {
     if (!playback.loop) return;
     playback.setLoopActive(!playback.loop.active);
   }, [playback]);
+  /**
+   * Halve or double the loop, from ‹ › or the half and double keys. A loop
+   * that is playing takes the new length at once, from its own in point: a
+   * beat loop on the grid, a manual loop in time. A head past the new out
+   * point keeps its place in the beat: it goes back by whole loops, not to
+   * the in point. With no loop playing, only the next beat loop changes.
+   */
+  const resizeLoop = useCallback((factor: number) => {
+    const loop = playback.loop;
+    if (!loop?.active || playback.idle) {
+      setLoopBeats((beats) => clampLoopBeats(beats * factor));
+      return;
+    }
+    // Rounded, so a loop from an on-beat IN finds its beat on the grid.
+    const resized = resizedLoopRange(grid, Math.round(loop.inSeconds * 1000), loop.outSeconds * 1000, loopBeats, factor);
+    if (!resized) return;
+    setLoopBeats(resized.beats);
+    const [from, to] = [resized.range[0] / 1000, resized.range[1] / 1000];
+    playback.setLoop(from, to);
+    const head = playback.positionNow();
+    const wrapped = wrapIntoLoop(head, from, to);
+    if (wrapped !== head) playback.seek(wrapped);
+  }, [playback, grid, loopBeats]);
+  /** AU or MA. A change drops an IN that waits for its OUT. */
+  const chooseLoopMode = useCallback((mode: "auto" | "manual") => {
+    setLoopMode(mode);
+    setLoopIn(null);
+  }, []);
+  /** OUT: the end of a waiting IN, or else RELOOP/EXIT. Both layouts. */
+  const loopOut = useCallback(() => {
+    if (loopIn !== null) markLoopOut();
+    else reloopOrExit();
+  }, [loopIn, markLoopOut, reloopOrExit]);
+  // The two-deck control row: AU starts a loop of the chosen length from
+  // the head and MA takes IN and OUT by hand, both on the grid when Q is on.
+  // The handlers are the one-deck layout's, so the two behave the same.
+  const dualLoop = useMemo(() => ({
+    mode: loopMode,
+    onMode: chooseLoopMode,
+    beats: loopBeats,
+    onShorter: () => resizeLoop(0.5),
+    onLonger: () => resizeLoop(2),
+    active: activeLoop,
+    pendingIn: loopIn !== null,
+    canLoop: !playback.idle && grid.times.length >= 2,
+    idle: playback.idle,
+    onToggle: autoLoop,
+    onIn: loopMode === "auto" ? () => loopOfBeats(loopBeats) : markLoopIn,
+    onOut: loopOut,
+    hasLoop: playback.loop !== null,
+  }), [loopMode, chooseLoopMode, loopBeats, resizeLoop, activeLoop, loopIn, playback.idle, playback.loop, grid.times.length,
+    autoLoop, loopOfBeats, markLoopIn, loopOut]);
   // A play is recorded after a minute of the track sounding, once per load,
   // when Preferences › Advanced › History says so and the library can be
   // written. rekordbox's own threshold is not recorded; a minute is what
@@ -1231,33 +1474,22 @@ export const Player = memo(function Player({
       if (cue.outMs > cue.positionMs) {
         playback.setLoop(cue.positionMs / 1000, cue.outMs / 1000);
       } else {
-        playback.seek(cue.positionMs / 1000);
+        seekInPhase(cue.positionMs / 1000);
       }
     },
-    [playback],
+    [playback, seekInPhase],
   );
 
-  // What the other deck reads when its BEAT SYNC is pressed. A ref holding a
-  // closure over the current render, registered once: the shell keeps the
-  // getter, not the values, so nothing here re-renders anything there.
-  const syncState = useRef<() => SyncDeck | null>(() => null);
-  syncState.current = () =>
-    track
-      ? {
-          bpmX100,
-          tempo: playback.tempo,
-          playing: playback.playing,
-          position: playback.positionNow(),
-          grid,
-        }
-      : null;
-  useEffect(() => {
-    publishSync?.(() => syncState.current());
-  }, [publishSync]);
-
+  /** The phase lock waits until this time: see `checkPhase`. */
+  const lockHold = useRef(0);
   /**
-   * PLAY. With BEAT SYNC lit and Q on, a stopped deck starts on the beat, as
-   * a CDJ with SYNC and QUANTIZE does: it is put on its own nearest beat and
+   * PLAY. With sync lit, a stopped deck starts on the beat, Q on or off and
+   * in BPM SYNC as in BEAT SYNC. rekordbox 7 does so with BEAT SYNC
+   * [OBS chris-win11, parity/issue-128], and its BPM SYNC behaviour starts
+   * PLAY with a beat-synced trigger that reads no quantize setting
+   * [OBS static, rekordbox 7.2.19 arm64: BpmSyncBehavior::onPlayWithSyncReq
+   * @0x102b71080 -> SlavePlayerFunctions::triggerWithBeatSync @0x102908398].
+   * The deck is put on its own nearest beat and
    * held until the master's next one lands, so the two are on the beat
    * together from the first sound. The wait is the engine's, counted in
    * output frames. A master that is not running has no next beat to wait
@@ -1265,7 +1497,20 @@ export const Player = memo(function Player({
    * playing, or one following nothing, simply toggles.
    */
   const togglePlay = useCallback(() => {
-    if (!playback.playing && synced && quantize) {
+    // PLAY while a CUE preview is held: the preview becomes real playback, so
+    // letting go of CUE no longer snaps back to the cue point. A running deck
+    // stays running; pausing it here would defeat the gesture. One whose
+    // preview ran out at the end of the track is started, as any stopped deck
+    // is, and stays where it is when CUE comes up. rekordbox 7 does both
+    // [OBS chris-win11, parity/issue-202].
+    // PLAY lines the deck up itself, so a load still waiting to be is done.
+    alignAfterLoad.current = null;
+    globalThis.clearTimeout(alignTimer.current);
+    if (previewing.current) {
+      previewing.current = false;
+      if (playback.playing) return;
+    }
+    if (!playback.playing && synced) {
       const leader = peerSync?.();
       const follower = syncState.current();
       if (leader && follower) {
@@ -1274,6 +1519,9 @@ export const Player = memo(function Player({
           const onBeat = nearestBeatMs(grid, follower.position * 1000) / 1000;
           if (Math.abs(onBeat - follower.position) > 0.001) playback.seek(onBeat);
           playback.playAfter(wait * 1000);
+          // The lock waits for the held start to end, so it does not move
+          // the deck before the deck sounds.
+          lockHold.current = performance.now() + wait * 1000 + PHASE_SETTLE_MS;
           return;
         }
         const nudge = beatNudgeFor(leader, follower);
@@ -1281,7 +1529,73 @@ export const Player = memo(function Player({
       }
     }
     playback.toggle();
-  }, [playback, synced, quantize, peerSync, grid]);
+  }, [playback, synced, peerSync, grid]);
+
+  /*
+   * A track loaded while PLAY is engaged starts as soon as it is ready (see
+   * `usePlayback`). On a synced deck it then goes onto the master's nearest
+   * beat, once: the load is the deck's own and the grid the new track's, not
+   * the last one's still on screen. A load on a stopped deck needs nothing
+   * here; PLAY lines it up. The tempo needs nothing either: the follow effect
+   * below matches the new file's BPM to the master's.
+   */
+  const loadedId = playback.idle ? null : track?.id ?? null;
+  // Read in the render the load happens in, where PLAY still says what it
+  // was: engaged, the new track will start by itself.
+  const playingAtLoad = playback.playing;
+  useEffect(() => {
+    alignAfterLoad.current = playingAtLoad ? loadedId : null;
+    // Only a new load arms it; PLAY changing on the same track does not.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loadedId]);
+  const loadReady = loadedId !== null && gridTrackId === loadedId && playback.duration > 0;
+  // Read when it runs, not when it was set: the master moves on meanwhile.
+  const alignToMaster = useEventCallback(() => {
+    if (!beatSynced || !playback.playing) return;
+    const leader = peerSync?.();
+    const follower = syncState.current();
+    if (!leader?.playing || !follower) return;
+    const nudge = beatNudgeFor(leader, follower);
+    if (Math.abs(nudge) <= PHASE_TOLERANCE) return;
+    // From the engine's own head, as the lock moves it, so the time the
+    // command takes does not put it off again.
+    playback.moveBy(nudge);
+    lockHold.current = performance.now() + PHASE_SETTLE_MS;
+  });
+  useEffect(() => {
+    if (!loadReady || !playback.playing || alignAfterLoad.current !== loadedId) return;
+    alignAfterLoad.current = null;
+    // After the engine has said where the new track is: until its first
+    // tick, the head here is a guess from when PLAY was sent.
+    alignTimer.current = globalThis.setTimeout(alignToMaster, PHASE_SETTLE_MS);
+  }, [loadReady, loadedId, playback.playing, alignToMaster]);
+  // Another load, or the deck going away, drops one still waiting.
+  useEffect(() => () => globalThis.clearTimeout(alignTimer.current), [loadedId]);
+
+  /*
+   * The phase lock. A locked deck that plays is checked ten times a second,
+   * and it goes back onto the master's beat when it is more than
+   * PHASE_TOLERANCE off. This catches what no single press can: a loop that
+   * starts again, a jump or a hot cue on the master, and the drift of a grid
+   * whose tempo changes. A drag holds the lock off until the drag lands.
+   */
+  const checkPhase = useEventCallback(() => {
+    const now = performance.now();
+    if (now < lockHold.current || playback.isScrubbing()) return;
+    const head = playback.positionNow();
+    const to = inPhase(head);
+    if (Math.abs(to - head) <= PHASE_TOLERANCE) return;
+    // A move from the engine's own head, not a seek to `to`: a seek lands
+    // late by the time the command takes, and the lock then moves again.
+    playback.moveBy(to - head);
+    // The ticks run a command behind the move: let the move arrive first.
+    lockHold.current = now + PHASE_SETTLE_MS;
+  });
+  useEffect(() => {
+    if (!phaseLocked || !playback.playing) return undefined;
+    const timer = globalThis.setInterval(checkPhase, PHASE_CHECK_MS);
+    return () => globalThis.clearInterval(timer);
+  }, [phaseLocked, playback.playing, checkPhase]);
 
   // AppleScript's PLAY and pause, read at the moment a script asks, and the
   // same PLAY a click gives: see `src/lib/scripting.ts`.
@@ -1343,8 +1657,11 @@ export const Player = memo(function Player({
     if (!viewPrefs.waveformClick || playback.idle || total <= 0) return;
     if (playback.playing) {
       setCuePoint(playback.positionNow());
+      playback.toggle();
+      return;
     }
-    playback.toggle();
+    // PLAY, so a synced deck starts on the master's beat as the button does.
+    togglePlay();
   };
 
   const dragDetail = (event: React.PointerEvent<HTMLDivElement>) => {
@@ -1357,13 +1674,14 @@ export const Player = memo(function Player({
   const endDrag = (event: React.PointerEvent<HTMLDivElement>) => {
     const held = grab.current;
     grab.current = null;
-    playback.scrubEnd();
+    const click = held !== null && event.type === "pointerup" && isClick(event.clientX - held.x, event.clientY - held.y);
+    // A click is PLAY or CUE, not a move, so it is left where it is. A drag
+    // on a locked deck lands on the master's beat: see `inPhase`.
+    playback.scrubEnd(!click && phaseLocked && playback.playing ? inPhase : undefined);
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
-    if (held && event.type === "pointerup" && isClick(event.clientX - held.x, event.clientY - held.y)) {
-      clickDetail();
-    }
+    if (click) clickDetail();
   };
 
   // A beat's length, for phrases whose time the grid did not resolve.
@@ -1379,6 +1697,13 @@ export const Player = memo(function Player({
   useEffect(() => {
     onPlayingBpm?.(playingBpmX100);
   }, [onPlayingBpm, playingBpmX100]);
+
+  // The key this deck sounds in moves with its key shift, and so does the
+  // set of keys the Traffic Light lights against it.
+  const keyShift = track ? playback.keyShift : 0;
+  useEffect(() => {
+    onKeyShift?.(keyShift);
+  }, [onKeyShift, keyShift]);
 
   /** Match this deck to the other one: its tempo, then its bar. */
   const matchLeader = useCallback(() => {
@@ -1425,6 +1750,42 @@ export const Player = memo(function Player({
     );
     if (Math.abs(tempo - playback.tempo) > 1e-4) playback.setTempo(tempo);
   }, [synced, leaderBpmX100, fileBpmX100, advancedPrefs.syncDoubleHalf, playback]);
+
+  // The metronome clicks on the grid the deck shows: a shift press at once,
+  // the saved grid when the save comes back. The first grid is the load's,
+  // which gives it to the engine itself.
+  const metronomeGrid = useRef(grid);
+  useEffect(() => {
+    if (metronomeGrid.current === grid) return;
+    metronomeGrid.current = grid;
+    const pairs = Array.from(grid.times, (ms, i): [number, boolean] => [ms, grid.numbers[i] === 1]);
+    void getBackend().then(backend => backend.setMetronomeGrid(deck, pairs)).catch(() => {});
+  }, [grid, deck]);
+
+  // The stand-in goes once nothing is left to save and the saved grid has
+  // caught up: equal to it, or changed since the last save ended (an undo,
+  // or an edit from the other deck). A refetch that does not come in a
+  // second is not waited for.
+  const savedWhenIdle = useRef<TrackBeatGrid | null>(null);
+  useEffect(() => {
+    if (gridEditor.nudging || nudgePreview === null) {
+      savedWhenIdle.current = null;
+      return;
+    }
+    const drop = () => {
+      savedWhenIdle.current = null;
+      setNudge(null);
+    };
+    savedWhenIdle.current ??= savedGrid;
+    const same = savedGrid.times.length === nudgePreview.times.length
+      && savedGrid.times.every((ms, i) => ms === nudgePreview.times[i]);
+    if (same || savedGrid !== savedWhenIdle.current) {
+      drop();
+      return;
+    }
+    const late = setTimeout(drop, 1000);
+    return () => clearTimeout(late);
+  }, [gridEditor.nudging, nudgePreview, savedGrid]);
 
   const [tempoResetLocked, setTempoResetLocked] = useState(true);
 
@@ -1535,11 +1896,11 @@ export const Player = memo(function Player({
           if (!event.repeat) reloopOrExit();
           break;
         case "loopHalf":
-          setLoopBeats((beats) => Math.max(0.25, beats / 2));
+          resizeLoop(0.5);
           break;
         case "loopDouble":
           event.preventDefault();
-          setLoopBeats((beats) => Math.min(32, beats * 2));
+          resizeLoop(2);
           break;
         case "sync":
           event.preventDefault();
@@ -2009,7 +2370,11 @@ export const Player = memo(function Player({
             beatMs={beatMs}
             labels={viewPrefs.phraseLabels}
           />
-        ) : null}
+        ) : (
+          // Keep the phrase row's grid track: the rows are placed by
+          // auto-flow, so omitting it shifts the detail into a fixed-height track.
+          <div className={styles.phrase} data-testid="player-phrase-off" aria-hidden />
+        )}
 
         {/* The control row comes before the detail in the two-deck body, as
             the capture has it: the detail is the last row, and takes what is
@@ -2021,6 +2386,7 @@ export const Player = memo(function Player({
             memory={memory}
             quantize={quantize}
             onQuantize={() => setQuantize((on) => !on)}
+            loop={dualLoop}
           />
         ) : null}
 
@@ -2265,7 +2631,7 @@ export const Player = memo(function Player({
                 data-on={loopMode === "auto" || undefined}
                 aria-pressed={loopMode === "auto"}
                 title={tip("Auto Beat Loop")}
-                onClick={() => setLoopMode("auto")}
+                onClick={() => chooseLoopMode("auto")}
               >
                 AU
               </button>
@@ -2275,7 +2641,7 @@ export const Player = memo(function Player({
                 data-on={loopMode === "manual" || undefined}
                 aria-pressed={loopMode === "manual"}
                 title={tip("Manual Loop")}
-                onClick={() => setLoopMode("manual")}
+                onClick={() => chooseLoopMode("manual")}
               >
                 MA
               </button>
@@ -2287,8 +2653,8 @@ export const Player = memo(function Player({
                   type="button"
                   className={styles.step}
                   aria-label="Shorter loop"
-                  disabled={loopBeats <= 0.25}
-                  onClick={() => setLoopBeats((beats) => Math.max(0.25, beats / 2))}
+                  disabled={loopBeats <= LOOP_BEATS_MIN}
+                  onClick={() => resizeLoop(0.5)}
                 >
                   ‹
                 </button>
@@ -2298,18 +2664,18 @@ export const Player = memo(function Player({
                   data-on={activeLoop || undefined}
                   aria-pressed={activeLoop}
                   aria-label={activeLoop ? "Exit loop" : `${loopBeats} beat loop`}
-                  title={tip(activeLoop ? "Exit the loop" : `Loop ${loopBeats} beat${loopBeats === 1 ? "" : "s"} from here`)}
+                  title={tip(activeLoop ? "Exit the loop" : `${loopBeatsLabel(loopBeats)} Beat Loop`)}
                   disabled={playback.idle || grid.times.length < 2}
                   onClick={autoLoop}
                 >
-                  {loopBeats < 1 ? `1/${Math.round(1 / loopBeats)}` : loopBeats}
+                  {loopBeatsLabel(loopBeats)}
                 </button>
                 <button
                   type="button"
                   className={styles.step}
                   aria-label="Longer loop"
-                  disabled={loopBeats >= 32}
-                  onClick={() => setLoopBeats((beats) => Math.min(32, beats * 2))}
+                  disabled={loopBeats >= LOOP_BEATS_MAX}
+                  onClick={() => resizeLoop(2)}
                 >
                   ›
                 </button>
@@ -2331,9 +2697,9 @@ export const Player = memo(function Player({
                   type="button"
                   className={styles.memoryLabel}
                   aria-label="Loop out"
-                  title={tip("Loop Out")}
-                  disabled={playback.idle || loopIn === null}
-                  onClick={markLoopOut}
+                  title={tip(loopIn !== null ? "Loop Out" : "Reloop/Exit")}
+                  disabled={loopIn === null && !playback.loop}
+                  onClick={loopOut}
                 >
                   OUT
                 </button>

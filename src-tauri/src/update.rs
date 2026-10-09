@@ -22,6 +22,11 @@
 //! - A Linux package (`.deb`, `.rpm`): installing needs a password prompt,
 //!   which is not quiet, so the download is staged and installed only from
 //!   the Update Manager's Restart Now.
+//! - The Microsoft Store (an MSIX package): the Store installs its updates,
+//!   so nothing here downloads or installs one. The NSIS installer would put
+//!   a second, separate copy next to the Store's, and Windows would go on
+//!   launching the Store's older one (#189). A check says the Store keeps
+//!   this copy up to date instead, without asking the download server.
 //!
 //! What has changed is worked out here, not in the interface: the notes are
 //! the full published release history, and the part that matters is the sections newer
@@ -39,9 +44,12 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use semver::Version;
 use serde::Serialize;
+use tauri::utils::config::BundleType;
+use tauri::utils::platform::bundle_type;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
+use crate::elevated_update;
 use crate::error::{AppError, AppResult, ErrorKind};
 
 /// The event a download's progress goes out on.
@@ -83,6 +91,9 @@ pub struct Updates {
 impl Updates {
     /// Where a staged installer is kept between the download and the quit.
     fn staging_dir(app: &AppHandle) -> Option<PathBuf> {
+        if let Some(dir) = elevated_update::shared_staging_dir().filter(|dir| dir.is_dir()) {
+            return Some(dir);
+        }
         app.path().app_cache_dir().ok().map(|dir| dir.join("update"))
     }
 
@@ -91,8 +102,11 @@ impl Updates {
     /// is the safe side: the signature was checked on the bytes that came
     /// down, not on a file that has sat in a cache since.
     pub fn clear_stale(app: &AppHandle) {
+        elevated_update::clear_shared_staging();
         if let Some(dir) = Self::staging_dir(app) {
-            let _ = std::fs::remove_dir_all(dir);
+            if elevated_update::shared_staging_dir().as_deref() != Some(dir.as_path()) {
+                let _ = std::fs::remove_dir_all(dir);
+            }
         }
     }
 }
@@ -100,9 +114,80 @@ impl Updates {
 /// Whether the bundle this process runs from can be swapped on disk while
 /// it runs, so an update is in place the moment it is downloaded.
 fn swaps_in_place() -> bool {
-    use tauri::utils::config::BundleType;
-    use tauri::utils::platform::bundle_type;
     matches!(bundle_type(), Some(BundleType::App | BundleType::AppImage))
+}
+
+/// `GetCurrentPackageFullName` results, as `winerror.h` numbers them. Kept
+/// here rather than taken from `windows-sys` so the decision below is the
+/// same code, and tested, on every platform.
+#[cfg(any(windows, test))]
+const ERROR_SUCCESS: u32 = 0;
+#[cfg(any(windows, test))]
+const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+#[cfg(test)]
+const APPMODEL_ERROR_NO_PACKAGE: u32 = 15_700;
+
+/// Whether a `GetCurrentPackageFullName` result means the process runs with
+/// a package identity: installed from an MSIX package, which on Windows
+/// rbxport only ships through the Microsoft Store.
+///
+/// Asked with an empty buffer, a packaged process gets
+/// `ERROR_INSUFFICIENT_BUFFER` (the name does not fit) and an unpackaged one
+/// `APPMODEL_ERROR_NO_PACKAGE`. Any other answer is not a package identity
+/// Windows vouched for, and the app keeps its own updater.
+#[cfg(any(windows, test))]
+fn has_package_identity(status: u32) -> bool {
+    matches!(status, ERROR_SUCCESS | ERROR_INSUFFICIENT_BUFFER)
+}
+
+/// Whether this process was installed by the Microsoft Store, which then
+/// owns its updates.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn store_install() -> bool {
+    use windows_sys::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
+    let mut length: u32 = 0;
+    // SAFETY: a zero length with a null buffer is the documented way to ask
+    // only whether there is a package name and how long it is; nothing is
+    // written through the null pointer.
+    let status = unsafe { GetCurrentPackageFullName(&raw mut length, std::ptr::null_mut()) };
+    has_package_identity(status)
+}
+
+/// Only Windows has Store packages.
+#[cfg(not(windows))]
+fn store_install() -> bool {
+    false
+}
+
+fn store_refusal() -> AppError {
+    AppError::new(ErrorKind::Internal, "The Microsoft Store installs this copy of rbxport's updates.")
+}
+
+/// Why this build cannot replace itself, if it cannot, mirroring the refusal
+/// the interface already shows for a development build.
+///
+/// A release build whose bundle marker is absent is one a distribution or
+/// package manager installed (a Linux source build, `.deb`/`.rpm`, or a Nix
+/// store build): it cannot write its own executable, so it must say so rather
+/// than download and fail on every launch. Taking the two facts as arguments
+/// keeps the decision testable.
+fn self_update_refusal(debug: bool, bundle: Option<&BundleType>) -> Option<AppError> {
+    if debug {
+        return Some(AppError::new(
+            ErrorKind::Internal,
+            "A development build cannot be updated in place.",
+        ));
+    }
+    // `cfg!` rather than an attribute keeps `bundle` used on every platform,
+    // where the workspace denies warnings.
+    if cfg!(target_os = "linux") && bundle.is_none() {
+        return Some(AppError::new(
+            ErrorKind::Internal,
+            "This build does not manage its own updates; use the package manager it was installed with.",
+        ));
+    }
+    None
 }
 
 /// One release's entry in the published release notes.
@@ -130,6 +215,9 @@ pub struct UpdateCheckDto {
     /// The version on offer is already downloaded this run: in place, or
     /// staged for the quit. Nothing to fetch again.
     pub ready: Option<UpdateReadyDto>,
+    /// This copy came from the Microsoft Store, which installs its updates;
+    /// the check did not ask the download server, and `version` is `None`.
+    pub store_install: bool,
 }
 
 /// A downloaded update, and whether it is already in the app's place.
@@ -166,6 +254,10 @@ pub async fn check_for_update(
     updates: tauri::State<'_, std::sync::Arc<Updates>>,
 ) -> AppResult<UpdateCheckDto> {
     let current_version = app.package_info().version.to_string();
+    if store_install() {
+        *updates.pending.lock() = None;
+        return Ok(store_check(current_version));
+    }
     let found = app
         .updater()
         .map_err(|e| updater_error("The updater is not configured.", e))?
@@ -175,7 +267,14 @@ pub async fn check_for_update(
 
     let Some(update) = found else {
         *updates.pending.lock() = None;
-        return Ok(UpdateCheckDto { current_version, version: None, date: None, changes: Vec::new(), ready: None });
+        return Ok(UpdateCheckDto {
+            current_version,
+            version: None,
+            date: None,
+            changes: Vec::new(),
+            ready: None,
+            store_install: false,
+        });
     };
 
     let changes = match (Version::parse(&update.current_version), Version::parse(&update.version)) {
@@ -201,9 +300,29 @@ pub async fn check_for_update(
         version: update.version.clone(),
         installed: *p == Placement::Installed,
     });
-    let dto = UpdateCheckDto { current_version, version: Some(update.version.clone()), date, changes, ready };
+    let dto = UpdateCheckDto {
+        current_version,
+        version: Some(update.version.clone()),
+        date,
+        changes,
+        ready,
+        store_install: false,
+    };
     *pending = Some(Pending { update, placement });
     Ok(dto)
+}
+
+/// What a check answers in a Microsoft Store install: nothing on offer from
+/// the download server, and the Store named as what updates this copy.
+fn store_check(current_version: String) -> UpdateCheckDto {
+    UpdateCheckDto {
+        current_version,
+        version: None,
+        date: None,
+        changes: Vec::new(),
+        ready: None,
+        store_install: true,
+    }
 }
 
 /// The update already downloaded in this run, without a network check.
@@ -230,11 +349,11 @@ pub async fn download_update(
     app: AppHandle,
     updates: tauri::State<'_, std::sync::Arc<Updates>>,
 ) -> AppResult<UpdateReadyDto> {
-    if cfg!(debug_assertions) {
-        return Err(AppError::new(
-            ErrorKind::Internal,
-            "A development build cannot be updated in place.",
-        ));
+    if let Some(refusal) = self_update_refusal(cfg!(debug_assertions), bundle_type().as_ref()) {
+        return Err(refusal);
+    }
+    if store_install() {
+        return Err(store_refusal());
     }
     let (update, placement) = {
         let pending = updates.pending.lock();
@@ -308,12 +427,25 @@ async fn place(app: &AppHandle, update: &Update, bytes: Vec<u8>) -> AppResult<Pl
     }
     let dir = Updates::staging_dir(app)
         .ok_or_else(|| AppError::new(ErrorKind::Internal, "There is nowhere to keep the update."))?;
-    // A fresh directory: whatever an earlier download of another version
-    // left is not what the quit should run.
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).map_err(|e| updater_error("The update could not be kept.", e))?;
-    let path = dir.join(format!("{}.update", update.version));
+    let shared = elevated_update::shared_staging_dir().as_deref() == Some(dir.as_path());
+    // Preserve the installer-created ACL on the shared directory. Only its
+    // known candidate files are disposable; the fallback cache directory can
+    // still be replaced wholesale.
+    if shared {
+        elevated_update::clear_shared_staging();
+    } else {
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| updater_error("The update could not be kept.", e))?;
+    }
+    let path = if shared {
+        dir.join("pending.update")
+    } else {
+        dir.join(format!("{}.update", update.version))
+    };
     std::fs::write(&path, &bytes).map_err(|e| updater_error("The update could not be kept.", e))?;
+    elevated_update::stage(&path, &update.version, &update.signature)
+        .map_err(|e| updater_error("The update could not be kept.", e))?;
     Ok(Placement::Staged(path))
 }
 
@@ -327,6 +459,9 @@ pub async fn restart_to_update(
     app: AppHandle,
     updates: tauri::State<'_, std::sync::Arc<Updates>>,
 ) -> AppResult<()> {
+    if store_install() {
+        return Err(store_refusal());
+    }
     let (update, placement) = {
         let pending = updates.pending.lock();
         let Some(pending) = pending.as_ref() else {
@@ -347,6 +482,11 @@ pub async fn restart_to_update(
             if let Some(pending) = updates.pending.lock().as_mut() {
                 pending.placement = None;
             }
+            match elevated_update::launch(&path, true) {
+                Ok(true) => std::process::exit(0),
+                Ok(false) => {}
+                Err(error) => tracing::warn!(%error, "the protected update task could not start"),
+            }
             let bytes = std::fs::read(&path).map_err(|e| updater_error("The update could not be read back.", e))?;
             // On Windows this spawns the installer and ends the process; a
             // Linux package is installed in place and the process is still
@@ -365,7 +505,7 @@ pub async fn restart_to_update(
 /// quit can run; a Linux package would prompt for a password, and stays for
 /// [`restart_to_update`].
 pub fn on_exit(app: &AppHandle) {
-    if !cfg!(windows) {
+    if !cfg!(windows) || store_install() {
         return;
     }
     let Some(updates) = app.try_state::<std::sync::Arc<Updates>>() else { return };
@@ -380,6 +520,11 @@ pub fn on_exit(app: &AppHandle) {
         }
     };
     let Some((update, path)) = staged else { return };
+    match elevated_update::launch(&path, false) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => tracing::warn!(%error, "the protected update task could not start at quit"),
+    }
     match std::fs::read(&path) {
         Ok(bytes) => {
             // `install` spawns the installer and ends this process itself.
@@ -389,6 +534,12 @@ pub fn on_exit(app: &AppHandle) {
         }
         Err(e) => tracing::warn!(error = %e, "the staged update could not be read back at quit"),
     }
+}
+
+/// Returns the process exit code when Windows started this binary as the
+/// protected update helper, or `None` for an ordinary application launch.
+pub fn run_elevated_helper_if_requested() -> Option<i32> {
+    elevated_update::run_if_requested()
 }
 
 /// The release-note sections newer than `current` and no newer than `target`,
@@ -473,6 +624,36 @@ mod tests {
 
     fn v(s: &str) -> Version {
         Version::parse(s).unwrap()
+    }
+
+    #[test]
+    fn a_packaged_process_is_a_store_install_and_an_unpackaged_one_is_not() {
+        // GetCurrentPackageFullName with an empty buffer: a package name
+        // that does not fit means there is one.
+        assert!(has_package_identity(ERROR_INSUFFICIENT_BUFFER));
+        assert!(has_package_identity(ERROR_SUCCESS));
+        // The NSIS install, a portable copy, a development run.
+        assert!(!has_package_identity(APPMODEL_ERROR_NO_PACKAGE));
+        // Anything else is not an identity Windows vouched for.
+        assert!(!has_package_identity(87), "ERROR_INVALID_PARAMETER");
+    }
+
+    #[test]
+    fn a_store_check_offers_nothing_and_names_the_store() {
+        let dto = store_check("1.2.0".to_owned());
+        assert!(dto.store_install);
+        assert_eq!(dto.version, None);
+        assert!(dto.ready.is_none() && dto.changes.is_empty());
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["storeInstall"], serde_json::Value::Bool(true));
+        assert_eq!(json["currentVersion"], "1.2.0");
+    }
+
+    #[test]
+    fn this_platform_is_not_a_store_install_off_windows() {
+        if !cfg!(windows) {
+            assert!(!store_install());
+        }
     }
 
     #[test]
@@ -580,5 +761,26 @@ See [the notes](https://example.com) — and `[x]: y` inline is prose.\n";
         let from_lf = changes_between(LOG, &v("0.1.0"), &v("0.4.0"));
         assert_eq!(from_crlf, from_lf);
         assert!(from_crlf.iter().all(|c| !c.body.contains('\r')), "a carriage return leaked");
+    }
+
+    #[test]
+    fn a_release_linux_build_without_a_bundle_refuses_to_update_in_place() {
+        // A from-source or package-managed Linux build has no bundle for the
+        // updater to swap, so it must refuse rather than download and fail on
+        // every launch.
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                self_update_refusal(false, None).is_some(),
+                "a bundleless Linux release must refuse"
+            );
+            assert!(
+                self_update_refusal(false, Some(&BundleType::AppImage)).is_none(),
+                "an AppImage build may replace itself"
+            );
+        }
+        // A development build refuses whatever the bundle is.
+        assert!(self_update_refusal(true, None).is_some());
+        assert!(self_update_refusal(true, Some(&BundleType::AppImage)).is_some());
     }
 }

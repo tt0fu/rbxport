@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { applyClick, clickSettles, emptySelection, modifierFor, pressSelects, selectAll } from "./selection";
+import {
+  applyClick, clickSettles, contextPress, emptySelection, inListOrder, modifierFor, pressModifier, pressSelects, selectAll,
+  selectedTracks,
+} from "./selection";
 
 describe("selection", () => {
   it("reads the modifier from the event", () => {
@@ -28,6 +31,25 @@ describe("selection", () => {
     expect(pressSelects(right, true)).toBe(false);
     expect(clickSettles(right, true)).toBe(false);
     expect(pressSelects(right, false)).toBe(true);
+  });
+
+  it("a macOS Control-click is the menu's press: it keeps the selection it lands in (#135)", () => {
+    // What WebKit and Chromium send on macOS before the contextmenu event.
+    const controlClick = { button: 0, shiftKey: false, metaKey: false, ctrlKey: true };
+    expect(contextPress(controlClick, true)).toBe(true);
+    expect(pressSelects(controlClick, true, true)).toBe(false);
+    expect(clickSettles(controlClick, true, true)).toBe(false);
+    // Outside the selection it selects that row alone, as a right-click does.
+    expect(pressSelects(controlClick, false, true)).toBe(true);
+    expect(pressModifier(controlClick, true)).toBe("none");
+    // Elsewhere Control is the toggle, as before.
+    expect(contextPress(controlClick, false)).toBe(false);
+    expect(pressSelects(controlClick, true, false)).toBe(true);
+    expect(pressModifier(controlClick, false)).toBe("toggle");
+    // ⌘ still toggles on macOS.
+    const command = { ...controlClick, ctrlKey: false, metaKey: true };
+    expect(contextPress(command, true)).toBe(false);
+    expect(pressModifier(command, true)).toBe("toggle");
   });
 
   it("a plain click replaces the selection and moves the anchor", () => {
@@ -74,5 +96,30 @@ describe("selection", () => {
     // An anchor already set is left where it was.
     const anchored = applyClick(emptySelection, { id: "b", index: 3 }, "none");
     expect(selectAll(anchored, ["a", "b", "c"]).anchorIndex).toBe(3);
+  });
+
+  it("reports every selected track even when most rows are not cached", () => {
+    // 30,000 selected, titles known for only the ~6,400 the row cache holds.
+    const ids = Array.from({ length: 30_000 }, (_, i) => String(100000 + i));
+    const titles = new Map(ids.slice(0, 6400).map((id) => [id, `Title ${id}`]));
+    const tracks = selectedTracks(selectAll(emptySelection, ids).ids, titles);
+    expect(tracks).toHaveLength(30_000);
+    expect(tracks[0]).toEqual({ id: "100000", title: "Title 100000" });
+    expect(tracks[29_999]).toEqual({ id: "129999", title: "129999" });
+  });
+
+  it("orders a ⌘-click selection top to bottom, as rekordbox's selected array is", () => {
+    // Clicked c, then a with ⌘: the set holds them in click order.
+    let state = applyClick(emptySelection, { id: "c", index: 2 }, "none");
+    state = applyClick(state, { id: "a", index: 0 }, "toggle");
+    expect([...state.ids]).toEqual(["c", "a"]);
+    expect(inListOrder(state.ids, ["a", "b", "c", "d"])).toEqual(["a", "c"]);
+  });
+
+  it("puts a selected id the list no longer shows last", () => {
+    const ids = new Set(["gone", "d", "b"]);
+    expect(inListOrder(ids, ["a", "b", "c", "d"])).toEqual(["b", "d", "gone"]);
+    // A track listed twice (a playlist may hold one twice) is reported once.
+    expect(inListOrder(new Set(["b"]), ["b", "a", "b"])).toEqual(["b"]);
   });
 });

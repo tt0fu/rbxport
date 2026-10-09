@@ -6,13 +6,23 @@ import { loadSession, saveSession } from "./session";
 
 export type BrowseContext = "collection" | "playlist" | "history" | "subBrowser" | "folder";
 
-// Verified numeric IDs from the measured rekordbox headers. Unknown IDs must
-// stay unknown: the XML has numeric IDs only, so guessing would map a visible
-// rekordbox field onto the wrong RBXport column.
+// Numeric column IDs, from the measured rekordbox headers and from the
+// comparator rekordbox 7.2.11 binds to each ID in
+// `browse::ListViewSorter::setCompFunc` [OBS: static analysis of the macOS
+// binary; every ID the headers had already verified names the same field
+// there]. Unknown IDs must stay unknown: the XML has numeric IDs only, so
+// guessing would map a visible rekordbox field onto the wrong RBXport column.
+// 65 is left out on purpose: rekordbox paints and sorts it by Hot Cue Auto
+// Load, which RBXport's Hot Cue column does not show.
 const IDS: Readonly<Record<string, ColumnKey>> = {
-  "20": "trackNo", "21": "title", "22": "artist", "24": "genre", "25": "comment",
-  "27": "rating", "29": "bpm", "34": "key", "44": "duration", "53": "releaseDate",
-  "60": "artwork", "68": "preview",
+  "1": "dateAdded", "20": "trackNo", "21": "title", "22": "artist", "23": "album",
+  "24": "genre", "25": "comment", "26": "year", "27": "rating", "28": "djPlayCount",
+  "29": "bpm", "30": "trackNumber", "31": "remixer", "32": "composer", "33": "label",
+  "34": "key", "35": "color", "36": "fileType", "37": "bitrate", "38": "location",
+  "39": "dateCreated", "41": "fileName", "42": "size", "43": "sampleRate",
+  "44": "duration", "46": "albumArtist", "47": "discNo", "48": "mixName",
+  "49": "originalArtist", "52": "bitDepth", "53": "releaseDate", "60": "artwork",
+  "66": "publishTrackInfo", "67": "message", "68": "preview", "72": "lyricist",
 };
 
 const SOURCES: Readonly<Record<BrowseContext, readonly string[]>> = {
@@ -65,19 +75,67 @@ export function parseRekordboxBrowseWidths(xml: string): { treeWidth?: number; s
   };
 }
 
+/**
+ * What the last startup import took from rekordbox, per context and for the
+ * pane widths, as the JSON it compared.
+ *
+ * rekordbox's file only changes when somebody changes rekordbox. Importing it
+ * on every start put rekordbox's columns back over whatever was chosen in
+ * RBXport since, so a column added, removed, moved or widened here was gone at
+ * the next launch (#207). Comparing against the last import means a layout is
+ * taken from rekordbox when rekordbox's own changed, and RBXport's edits stand
+ * otherwise.
+ */
+const IMPORTED_KEY = "rbl.browse-import.v1";
+
+type Imported = Partial<Record<BrowseContext | "panes", string>>;
+
+function loadImported(): Imported {
+  try {
+    const raw = localStorage.getItem(IMPORTED_KEY);
+    const value: unknown = raw === null ? null : JSON.parse(raw);
+    if (typeof value !== "object" || value === null) return {};
+    const imported: Imported = {};
+    for (const [key, entry] of Object.entries(value)) {
+      if (typeof entry === "string") imported[key as keyof Imported] = entry;
+    }
+    return imported;
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Applies rekordbox's browse settings, leaving alone every part whose
+ * rekordbox value is the one already imported last time.
+ */
+export function applyRekordboxBrowse(xml: string): void {
+  const imported = loadImported();
+  const next: Imported = { ...imported };
+  for (const [context, layout] of Object.entries(parseRekordboxBrowse(xml)) as [BrowseContext, Layout][]) {
+    const value = JSON.stringify(layout);
+    if (imported[context] === value) continue;
+    localStorage.setItem(`rbl.columns.v2.${context}`, value);
+    next[context] = value;
+  }
+  const widths = parseRekordboxBrowseWidths(xml);
+  if (widths.treeWidth !== undefined || widths.subWidth !== undefined) {
+    const value = JSON.stringify(widths);
+    if (imported.panes !== value) {
+      saveSession({ ...loadSession(), ...widths });
+      next.panes = value;
+    }
+  }
+  localStorage.setItem(IMPORTED_KEY, JSON.stringify(next));
+}
+
 /** Run before the main window mounts, so useColumns reads the imported layout. */
 export async function syncRekordboxBrowseAtStartup(): Promise<void> {
   if (!loadPreferences().rekordbox.syncBrowseSettings) return;
   try {
     const xml = await (await getBackend()).rekordboxBrowseSettings();
     if (!xml) return;
-    for (const [context, layout] of Object.entries(parseRekordboxBrowse(xml))) {
-      localStorage.setItem(`rbl.columns.v2.${context}`, JSON.stringify(layout));
-    }
-    const widths = parseRekordboxBrowseWidths(xml);
-    if (widths.treeWidth !== undefined || widths.subWidth !== undefined) {
-      saveSession({ ...loadSession(), ...widths });
-    }
+    applyRekordboxBrowse(xml);
   } catch {
     // A missing or unreadable rekordbox install leaves local layouts intact.
   }
