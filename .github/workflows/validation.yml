@@ -183,7 +183,7 @@ jobs:
       inputs.validate_frontend_budget) || needs.frontend.result == 'success') &&
       (!inputs.validate_nix || needs.nix-source.result == 'success') &&
       (!inputs.validate_macos || needs.macos-intel.result == 'success')))
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     steps:
       - run: |
           if [ "${{ inputs.skip_tests }}" = true ]; then
