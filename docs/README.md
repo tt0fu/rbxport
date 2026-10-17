@@ -53,3 +53,5 @@ of the public repository.
 `assets/brand/` contains the app icons, graphics, wordmarks, combined logos,
 and reference board. See its `README.txt` for format details. The centered
 README logo uses the existing color/white lockup.
+
+<!-- ci simulation -->
