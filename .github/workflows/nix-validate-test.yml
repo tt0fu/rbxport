@@ -1,0 +1,13 @@
+name: Test Nix source smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    uses: ./.github/workflows/validate-nix.yml
+    with:
+      source_ref: ${{ github.sha }}
