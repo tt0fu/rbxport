@@ -60,6 +60,7 @@ jobs:
           appimage=""
           if [ -d fresh ]; then
             appimage="$(find fresh -name '*.AppImage' -print -quit)"
+            [ -z "$appimage" ] || appimage="$(realpath "$appimage")"
           fi
           echo "appimage=$appimage" >> "$GITHUB_OUTPUT"
 
